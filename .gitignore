@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+build/
+outputs/
+*.py[cod]
+
+work/
+assets/dictionary.sqlite3
+android/app/src/main/assets/dictionary.sqlite3
+.coverage

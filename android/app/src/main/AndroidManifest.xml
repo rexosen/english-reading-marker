@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="cn.readingdesk.reader" android:versionCode="6" android:versionName="1.5.0">
+  <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"/>
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+  <queries><intent><action android:name="android.intent.action.TTS_SERVICE"/></intent></queries>
+  <application android:label="英语阅读标记器" android:icon="@drawable/icon" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="true" android:allowBackup="false" android:enableOnBackInvokedCallback="false" android:supportsRtl="true">
+    <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+    </activity>
+  </application>
+</manifest>
