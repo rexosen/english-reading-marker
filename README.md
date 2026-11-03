@@ -8,12 +8,12 @@
 - 美式/英式发音，四档语速；单词音频取自有道词典并按需缓存，句段使用系统 TTS / edge-tts。
 - 生词本独立窗口，支持释义、来源原句与 CSV（UTF-8 BOM，Excel 友好）导出。
 - 学习视图：分句、分组、笔记、复习评分（`src/study.py` / `study_ui.py` / 安卓 `learning.js`）。
-- 听力训练（Windows）：逐句“听懂/没听懂”自评与“只重听没听懂句”，听写练习按词对照并给出准确率，0.6–1.25 五档语速。
+- 听力训练（Windows 与安卓）：逐句“听懂/没听懂”自评与“只重听没听懂句”，听写练习按词对照并给出准确率，0.6–1.25 五档语速。
 - 安卓与 Windows 局域网同步：文章、划线、生词、阅读位置双向同步；6 位一次性配对码，凭证只存哈希，操作按 ID 去重。
 - 数据固定存放于 `%USERPROFILE%/Documents/EnglishReadingMarker/reader.sqlite3`，每天首次打开自动快照备份。
 
 ## 版本与下载
-- 最新安装包见 [Releases](https://github.com/rexosen/english-reading-marker/releases)：Windows 桌面版 v1.3.3（听写模式、逐句自评、1.25 倍速）、Android 版 v1.5。
+- 最新安装包见 [Releases](https://github.com/rexosen/english-reading-marker/releases)：Windows 桌面版 v1.3.3、Android 版 v1.6（两版均含听写模式、逐句自评、1.25 倍速）。
 - 完整演进记录见下方各版本小节。
 
 ## 快速开始
@@ -138,7 +138,14 @@ Windows恢复：预览→用户确认→备份当前→暂存→退出→下次�
 - 逐句控制新增“✓ 听懂 / ✗ 没听懂”自评与“只重听没听懂句”开关：标记绑定文章编号与句子位置，正文编辑后旧标记自动失效；开启后上一句/下一句/自动推进只在没听懂的句子间跳转。自评保存在本机资料目录 `listening_reviews.json`，不进入手机同步数据。
 - 新增“听写练习（当前文章）”（“学习”菜单与“学习与阅读”菜单）：隐藏原文逐句播放，手敲听写内容，对照时按词标注写错（红色下划线）与漏写（红色方括号），忽略大小写、标点与撇号差异，给出每句与平均准确率。
 - 发音设置增加 1.25 倍速，用于高于考场语速的抗干扰训练；朗读状态栏改为显示当前实际倍速。
-- 听写词级对照（`src/dictation.py`）与自评存储（`src/listening.py`）为独立可测模块；75 项测试全部通过（新增听写 7 项、自评 6 项、窗口集成 2 项）。安卓端未包含本次功能，桌面听写与自评仅 Windows。
+- 听写词级对照（`src/dictation.py`）与自评存储（`src/listening.py`）为独立可测模块；75 项测试全部通过（新增听写 7 项、自评 6 项、窗口集成 2 项）。本次仅 Windows；安卓端于同日 1.6 版补齐，见下节。
+
+## 2026-11-03：安卓 1.6 听力训练移植
+- 逐句控制新增“✓ 听懂 / ✗ 没听懂”自评与“只重听没听懂句”开关（`learning.js`）：标记存 localStorage 独立键 `listening-v1`，不进同步 outbox，不影响电脑端数据；按文章 ID + 句子范围 + 原文校验，正文编辑后旧标记自动失效；开启后上一句/下一句/自动推进只在没听懂句之间跳转。
+- 新增“⌨ 听写”浮层：隐藏原文逐句播放，手敲后按词对照（红下划线=写错、红方括号=漏写、多写词单列），给出本句与平均准确率；判分算法 `dictationCompare` 与桌面 `src/dictation.py` 在四个用例上逐词一致。
+- 发音设置新增 1.25 倍速档；`MainActivity` 速度钳制放宽到 1.25，在线整句（setPlaybackParams）、词典单词与系统 TTS 全通道生效。
+- 交付 [v1.6 Release](https://github.com/rexosen/english-reading-marker/releases/tag/v1.6)（versionCode 7，v2/v3 签名，与 v1.5 同密钥可覆盖安装）；Windows v1.3.3 zip 内嵌 APK 同步更新至 1.6，手机从电脑“下载手机版”即得新版。
+- `tests/mobile_e2e.cjs` 扩展听力训练段：自评落盘、outbox 不变、只重听从没听懂句开始、听写满分与错词判定；360/393px 布局无溢出，Chromium 桥端到端通过。
 
 ## 许可
 MIT License，见 [LICENSE](LICENSE)。离线词典数据来自 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）。样例文章及用户导入的文章内容版权归原出处所有，分发或公开使用时请注意排除受版权保护的文章文本。

@@ -366,7 +366,7 @@ public class MainActivity extends Activity {
                     }else if(action.equals("speak")){
                         String text=p.getString("text").trim();
                         String accent=p.optString("accent","us").equals("uk")?"uk":"us";
-                        double speed=Math.max(0.6,Math.min(1.0,p.optDouble("speed",0.75)));
+                        double speed=Math.max(0.6,Math.min(1.25,p.optDouble("speed",0.75)));
                         String source=p.optString("source","dictionary").equals("system")?"system":"dictionary";
                         String requestTag=p.optString("request_id","");
                         runOnUiThread(()->startSpeech(text,accent,speed,source,requestTag));response.put("ok",true);

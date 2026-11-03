@@ -43,7 +43,7 @@ const renamed=core.clone(fixture.articles);core.apply(renamed,{type:'rename',art
   assert.equal(await page.locator('.token.marked').count(),1);
   await page.locator('#closeLookup').click();
   network=false;await page.locator('.token').filter({hasText:/^Students$/}).first().click();await page.locator('#lookupDefinition').filter({hasText:'在线的'}).waitFor();await page.locator('#lookupMark').click();await page.locator('#closeLookup').click();await page.locator('[data-page="articles"]').click();
-  page.once('dialog',dialog=>dialog.accept('Phone title'));await page.locator('.rename').click();
+  page.once('dialog',dialog=>dialog.accept('Phone title'));await page.locator('.articleMore').click();await page.locator('#renameArticle').click();
   assert.ok(await page.evaluate(()=>JSON.parse(localStorage.getItem('reader-v1')).outbox.some(x=>x.type==='rename')));
   await page.reload();await page.locator('.title').filter({hasText:'Phone title'}).waitFor();
   const stored=await page.evaluate(()=>JSON.parse(localStorage.getItem('reader-v1'))),a=stored.articles[0];
@@ -57,6 +57,28 @@ const renamed=core.clone(fixture.articles);core.apply(renamed,{type:'rename',art
   await page.locator('[data-page="articles"]').click();await page.locator('.openArticle').click();
   await page.evaluate(()=>{const body=document.getElementById('readingArea'),r=document.createRange();r.selectNodeContents(body);const s=window.getSelection();s.removeAllRanges();s.addRange(r);});
   await page.locator('#selectionBar').waitFor({state:'visible'});await page.locator('#selectionTranslate').click();await page.locator('#lookupDefinition').filter({hasText:'测试译文'}).waitFor();await page.locator('#lookupSpeak').click();assert.ok(spoken.includes('Students learn'));assert.equal(speechConfig.accent,'uk');assert.equal(speechConfig.speed,0.6);assert.equal(speechConfig.source,'dictionary');
+  // Listening training: per-sentence self-assessment, missed-only replay, dictation diff.
+  await page.locator('#closeLookup').click();
+  const outboxBefore=await page.evaluate(()=>JSON.parse(localStorage.getItem('reader-v1')).outbox.length);
+  await page.locator('#markHeard').click();
+  await page.locator('#markMissed').click();
+  const firstSentence=await page.evaluate(()=>splitSentences(article().text)[0].text);
+  const articleMarks=await page.evaluate(()=>{const s=JSON.parse(localStorage.getItem('reader-v1'));return (JSON.parse(localStorage.getItem('listening-v1')||'{}')[s.articles[0].id]||{});});
+  assert.ok(Object.values(articleMarks).some(x=>x.status==='missed'),'没听懂标记已保存');
+  const outboxAfter=await page.evaluate(()=>JSON.parse(localStorage.getItem('reader-v1')).outbox.length);
+  assert.equal(outboxAfter,outboxBefore,'听力标记不进同步队列');
+  await page.locator('#replayMissedOnly').check();
+  await page.locator('#sentencePlay').click();
+  await page.waitForFunction(()=>document.getElementById('sentenceStatus').textContent.includes('第 1/'));
+  assert.equal(spoken,firstSentence,'只重听从没听懂句开始');
+  await page.locator('#openDictation').click();
+  await page.locator('#dictationTyped').fill(firstSentence);
+  await page.locator('#dictationCheck').click();
+  assert.ok((await page.locator('#dictationResult').textContent()).includes('100%'),'听写满分判定');
+  await page.locator('#dictationTyped').fill('students learnt');
+  await page.locator('#dictationCheck').click();
+  assert.ok((await page.locator('#dictationResult').textContent()).includes('多写的词'),'错词与多写识别');
+  await page.locator('#dictationClose').click();
   for(const width of [360,393]){await page.setViewportSize({width,height:852});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
   await page.screenshot({path:path.join(root,'work/mobile_e2e.png'),fullPage:false});
   assert.deepEqual(errors,[]);console.log('PASS: offline merge, pairing, sync, exact underline, vocabulary, offline reload, rename conflict, CSV, paragraph selection, speech bridge, audio settings persistence, 360/393px layout.');

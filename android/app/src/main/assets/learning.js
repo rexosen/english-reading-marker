@@ -105,10 +105,35 @@ function splitSentences(text){
  }
  const rest=text.slice(start),leading=rest.match(/^\s*/)[0].length;if(rest.trim())ranges.push({start:Array.from(text.slice(0,start+leading)).length,end:Array.from(text.trimEnd()).length,text:rest.trim()});return ranges;
 }
+/* Listening marks and dictation stay in localStorage only; they never enter the sync outbox. */
+function listeningLoad(){try{const data=JSON.parse(localStorage.getItem('listening-v1')||'{}');return data&&typeof data==='object'&&!Array.isArray(data)?data:{};}catch(e){return {};}}
+function listeningSave(data){try{localStorage.setItem('listening-v1',JSON.stringify(data));}catch(e){toast('本机存储空间不足，这次标记没有保存');}}
+function listeningStatus(articleId,start,end,text){const record=(listeningLoad()[articleId]||{})[start+':'+end];return record&&record.text===text?record.status:null;}
+function listeningMark(articleId,start,end,text,status){const data=listeningLoad(),records=data[articleId]||{};
+ if(status===null)delete records[start+':'+end];else records[start+':'+end]={text,status,updated:new Date().toISOString()};
+ data[articleId]=records;listeningSave(data);}
+function listeningMissed(articleId,ranges){const marks=listeningLoad()[articleId]||{},result=[];
+ ranges.forEach((s,i)=>{const record=marks[s.start+':'+s.end];if(record&&record.status==='missed'&&record.text===s.text)result.push(i);});return result;}
+function sentenceOrder(ranges){if(!$('replayMissedOnly')||!$('replayMissedOnly').checked)return ranges.map((_,i)=>i);
+ const order=listeningMissed(activeId,ranges);return order.length?order:ranges.map((_,i)=>i);}
+function updateMissedCount(){if(!$('missedCount'))return;const a=article();
+ $('missedCount').textContent=a?'没听懂 '+listeningMissed(a.id,splitSentences(a.text)).length+' 句':'';}
+function currentSentenceRange(){const a=article();if(!a)return null;
+ if(sentenceSession&&sentenceSession.ranges[sentenceSession.index])return sentenceSession.ranges[sentenceSession.index];
+ const ranges=splitSentences(a.text),position=selected&&selected.article_id===a.id?selected.start:0;
+ return ranges.find(s=>s.end>position)||ranges[0]||null;}
+function markCurrentSentence(status){const s=currentSentenceRange();if(!s)return;
+ const after=listeningStatus(activeId,s.start,s.end,s.text)===status?null:status;
+ listeningMark(activeId,s.start,s.end,s.text,after);
+ const label={'heard':'已标记听懂','missed':'已标记没听懂',null:'已清除标记'}[after];
+ $('sentenceStatus').textContent='当前句 · '+label;updateMissedCount();}
 function installSentenceControls(){
  $('sentenceControls').className='sentenceControls';
- $('sentenceControls').innerHTML='<div class="actions"><button id="sentencePrevious" class="small">上一句</button><button id="sentencePlay" class="small">▶ 逐句</button><button id="sentenceNext" class="small">下一句</button><button id="saveCurrentSentence" class="small">收藏当前句</button></div><div class="actions"><select id="sentenceMode"><option value="all">逐句继续</option><option value="one">仅当前句</option></select><input id="sentenceRepeat" type="number" value="1" min="1" max="99" aria-label="每句次数"><span class="muted">遍</span><input id="sentenceGap" type="number" value="1" min="0" max="30" step="0.5" aria-label="句间停顿秒"><span class="muted">秒停顿</span></div><div id="sentenceStatus" class="muted">选择句段后可从该句开始，或点“逐句”从开头开始。</div>';
+ $('sentenceControls').innerHTML='<div class="actions"><button id="sentencePrevious" class="small">上一句</button><button id="sentencePlay" class="small">▶ 逐句</button><button id="sentenceNext" class="small">下一句</button><button id="saveCurrentSentence" class="small">收藏当前句</button></div><div class="actions"><select id="sentenceMode"><option value="all">逐句继续</option><option value="one">仅当前句</option></select><input id="sentenceRepeat" type="number" value="1" min="1" max="99" aria-label="每句次数"><span class="muted">遍</span><input id="sentenceGap" type="number" value="1" min="0" max="30" step="0.5" aria-label="句间停顿秒"><span class="muted">秒停顿</span></div><div class="actions"><button id="markHeard" class="small">✓ 听懂</button><button id="markMissed" class="small">✗ 没听懂</button><label class="row" style="gap:6px"><input id="replayMissedOnly" type="checkbox" style="width:auto"><span class="muted">只重听没听懂句</span></label><button id="openDictation" class="small">⌨ 听写</button><span id="missedCount" class="muted"></span></div><div id="sentenceStatus" class="muted">选择句段后可从该句开始，或点“逐句”从开头开始。</div>';
  $('sentencePlay').onclick=()=>beginSentence();$('sentencePrevious').onclick=()=>stepSentence(-1);$('sentenceNext').onclick=()=>stepSentence(1);
+ $('markHeard').onclick=()=>markCurrentSentence('heard');$('markMissed').onclick=()=>markCurrentSentence('missed');
+ $('replayMissedOnly').onchange=updateMissedCount;$('openDictation').onclick=openDictation;
+ updateMissedCount();
  $('saveCurrentSentence').onclick=()=>{const s=sentenceSession?.ranges[sentenceSession.index]||splitSentences(article().text).find(s=>s.end>(selected?.start||0));if(!s)return;selected={article_id:activeId,start:s.start,end:s.end,word:s.text};currentDefinition='';saveSelectedSentence();};
 }
 function highlightSentence(start,end){document.querySelectorAll('#readingArea .token').forEach(t=>t.classList.toggle('speaking',+t.dataset.start<end&&+t.dataset.end>start));}
@@ -119,12 +144,24 @@ function stopSequence(){
 function stopLearningSpeech(){stopSequence();nativeCall('stop',{}).catch(e=>toast(e.message));if($('sentenceStatus'))$('sentenceStatus').textContent='已停止';}
 function beginSentence(index=null){
  const a=article();if(!a)return;const ranges=splitSentences(a.text);if(!ranges.length)return;
+ const order=sentenceOrder(ranges);
  const position=selected?.article_id===a.id?selected.start:0;
- const current=index===null?Math.max(0,ranges.findIndex(s=>s.end>position)):Math.min(ranges.length-1,Math.max(0,index));
+ let current;
+ if(index===null)current=order.find(i=>ranges[i].end>position)??order[0];
+ else current=order.includes(index)?index:(order.find(i=>i>=index)??order[order.length-1]);
  stopSequence();
- sentenceSession={ranges,index:current,round:0,id:null};playSentence();
+ sentenceSession={ranges,order,index:current,round:0,id:null};playSentence();
 }
-function stepSentence(direction){beginSentence((sentenceSession?.index??0)+direction);}
+function stepSentence(direction){
+ if(!sentenceSession){beginSentence(direction>0?0:null);return;}
+ const pos=sentenceSession.order.indexOf(sentenceSession.index),target=pos+direction;
+ if(pos<0||target<0||target>=sentenceSession.order.length)return;
+ const ranges=sentenceSession.ranges;
+ stopSequence();
+ sentenceSession={ranges,order:sentenceOrder(ranges),index:0,round:0,id:null};
+ sentenceSession.index=sentenceSession.order[Math.min(target,sentenceSession.order.length-1)];
+ playSentence();
+}
 function playSentence(){
  if(!sentenceSession||page!=='read')return;
  const session=sentenceSession,s=session.ranges[session.index],repeat=Math.max(1,Math.min(99,Number($('sentenceRepeat').value)||1));
@@ -136,7 +173,7 @@ window.nativeSpeechDone=(id,error)=>{
  const session=sentenceSession;if(!session||session.id!==id)return;
  if(error){stopSequence();toast(error);return;}
  session.round++;const repeat=Math.max(1,Math.min(99,Number($('sentenceRepeat').value)||1));
- if(session.round>=repeat){if($('sentenceMode').value==='one'||session.index+1>=session.ranges.length){stopSequence();$('sentenceStatus').textContent='逐句朗读完成';return;}session.index++;session.round=0;}
+  if(session.round>=repeat){const pos=session.order.indexOf(session.index);if($('sentenceMode').value==='one'||pos+1>=session.order.length){stopSequence();$('sentenceStatus').textContent='逐句朗读完成';return;}session.index=session.order[pos<0?0:pos+1];session.round=0;}
  const gap=Math.max(0,Math.min(30,Number($('sentenceGap').value)||0));
  sentenceTimeout=setTimeout(()=>{sentenceTimeout=null;playSentence();},gap*1000);
 };
@@ -192,6 +229,54 @@ function renderBackups(){
  $('makeBackup').onclick=()=>{try{backupMobile();refresh();toast('备份已保存');}catch(e){toast(e.message);}};
  $('exportBackup').onclick=async()=>{try{const data=SyncCore.clone(state);data.config={url:data.config.url,token:''};await nativeCall('exportBackup',{data:JSON.stringify({format:'readingdesk-mobile',version:2,created_at:new Date().toISOString(),data})});toast('请选择文件保存位置');}catch(e){toast(e.message);}};
  $('importBackup').onclick=async()=>{try{const result=await nativeCall('importBackup',{});if(result.cancelled)return;const payload=JSON.parse(result.data);if(payload.format!=='readingdesk-mobile'||payload.version!==2)throw Error('不是此版本的手机备份文件');restoreMobile(payload.data);}catch(e){toast(e.message);}};refresh();
+}
+/* Dictation hides the original, plays one sentence, then diffs typed words; mirrors src/dictation.py. */
+function dictationTokens(text){return (text.toLowerCase().replace(/[\u2019]/g,"'").match(/[a-z][a-z'-]*|\d+(?:[.,]\d+)*/g)||[]).map(w=>w.replace(/'/g,''));}
+function dictationCompare(expected,typed){
+ const exp=dictationTokens(expected),typ=dictationTokens(typed),n=exp.length,m=typ.length;
+ const dp=Array.from({length:n+1},()=>new Array(m+1).fill(0));
+ for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)dp[i][j]=exp[i]===typ[j]?dp[i+1][j+1]+1:Math.max(dp[i+1][j],dp[i][j+1]);
+ const statuses=new Array(n).fill('missing'),extra=[];
+ let i=0,j=0;
+ while(i<n&&j<m){
+  if(exp[i]===typ[j]){statuses[i]='ok';i++;j++;continue;}
+  const skipExp=dp[i+1][j],skipTyp=dp[i][j+1];
+  if(skipExp>skipTyp){statuses[i]='missing';i++;}
+  else if(skipTyp>skipExp){extra.push(typ[j]);j++;}
+  else{statuses[i]='wrong';extra.push(typ[j]);i++;j++;}
+ }
+ while(i<n){statuses[i]='missing';i++;}
+ while(j<m){extra.push(typ[j++]);}
+ const ok=statuses.filter(s=>s==='ok').length;
+ return {expected:exp,statuses,extra,accuracy:n?ok/n:1};
+}
+function openDictation(){
+ const a=article();if(!a){toast('请先打开一篇文章');return;}
+ const ranges=splitSentences(a.text);if(!ranges.length){toast('这篇文章没有可用于听写的句子');return;}
+ stopSequence();
+ const position=selected&&selected.article_id===a.id?selected.start:0;
+ const session={index:Math.max(0,ranges.findIndex(s=>s.end>position)),results:[]};
+ const overlay=document.createElement('div');overlay.className='overlay';
+ overlay.innerHTML='<section class="sheet"><div class="row"><h3 class="grow">听写练习</h3><button class="small" id="dictationClose">关闭</button></div><div id="dictationInfo" class="muted"></div><textarea id="dictationTyped" placeholder="听一句，敲一句；没听清的词先跳过，对照后再补。" style="min-height:90px"></textarea><div class="actions"><button class="small" id="dictationPrev">上一句</button><button class="small" id="dictationPlay">▶ 播放本句</button><button class="small" id="dictationCheck">对照答案</button><button class="small primary" id="dictationNext">下一句 ▶</button></div><div id="dictationResult" class="muted" style="line-height:2"></div></section>';
+ document.body.appendChild(overlay);
+ const close=()=>overlay.remove();
+ $('dictationClose').onclick=close;
+ overlay.onclick=event=>{if(event.target===overlay)close();};
+ const info=$('dictationInfo'),typed=$('dictationTyped'),result=$('dictationResult');
+ function show(){typed.value='';result.innerHTML='';info.textContent='第 '+(session.index+1)+'/'+ranges.length+' 句 · 原文已隐藏，播放后听写，再对照';}
+ function play(){nativeCall('speak',{text:ranges[session.index].text,...state.audio}).catch(e=>toast(e.message));}
+ function check(){const cmp=dictationCompare(ranges[session.index].text,typed.value);
+  const parts=cmp.expected.map((w,idx)=>cmp.statuses[idx]==='ok'?esc(w):cmp.statuses[idx]==='wrong'?'<b style="color:#c0392b;text-decoration:underline">'+esc(w)+'</b>':'<b style="color:#c0392b">['+esc(w)+']</b>');
+  session.results.push(cmp.accuracy);
+  const avg=session.results.reduce((x,y)=>x+y,0)/session.results.length;
+  result.innerHTML='正确答案：'+parts.join(' ')+(cmp.extra.length?'<br>多写的词：'+esc(cmp.extra.join(' ')):'')+'<br>本句准确率 '+(cmp.accuracy*100).toFixed(0)+'% · 已对照 '+session.results.length+' 句平均 '+(avg*100).toFixed(0)+'%（红=写错，[红]=漏写）';}
+ function move(direction){const target=session.index+direction;
+  if(target<0)return;
+  if(target>=ranges.length){info.textContent='全文听写结束 · 已对照 '+session.results.length+' 句'+(session.results.length?' · 平均准确率 '+(session.results.reduce((x,y)=>x+y,0)/session.results.length*100).toFixed(0)+'%':'');return;}
+  session.index=target;show();play();}
+ $('dictationPrev').onclick=()=>move(-1);$('dictationNext').onclick=()=>move(1);
+ $('dictationPlay').onclick=play;$('dictationCheck').onclick=check;
+ show();
 }
 function initLearning(){
  $('selectionNote').onclick=saveSelectedSentence;$('lookupNote').onclick=saveSelectedSentence;
