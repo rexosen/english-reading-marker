@@ -334,6 +334,38 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.audio_source, "system")
         self.assertEqual(self.window.audio_settings.value("accent"), "uk")
 
+    def test_audio_settings_offer_above_exam_speed(self):
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QComboBox
+        def change_settings():
+            dialog = QApplication.activeModalWidget()
+            combos = dialog.findChildren(QComboBox)
+            combos[2].setCurrentIndex(combos[2].findData(1.25))
+            dialog.accept()
+        QTimer.singleShot(0, change_settings)
+        self.window.open_audio_settings()
+        self.assertEqual(self.window.audio_speed, 1.25)
+        self.assertEqual(float(self.window.audio_settings.value("speed")), 1.25)
+
+    def test_listening_marks_drive_replay_order(self):
+        from src.study import sentence_ranges
+        self.window._sentences = sentence_ranges(self.window.reader.toPlainText())
+        self.assertGreaterEqual(len(self.window._sentences), 4)
+        self.window._sentence_index = 1
+        self.window._mark_sentence("missed")
+        self.window._sentence_index = 3
+        self.window._mark_sentence("missed")
+        sync_id = self.window._current_sync_id()
+        self.assertEqual(len(self.window.listening.missed(sync_id, self.window._sentences)), 2)
+        self.window.replay_missed.setChecked(True)
+        self.assertEqual(self.window._sentence_order(), [1, 3])
+        self.window._sentence_index = 1
+        self.window.step_sentence(1)
+        self.assertEqual(self.window._sentence_index, 3)
+        self.window.step_sentence(1)
+        self.assertEqual(self.window._sentence_index, 3)
+        self.window.cancel_sentence_sequence()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -409,6 +409,7 @@ class MainWindow(StudyUi, QMainWindow):
             ("收藏所选句段", self.save_selected_note),
             ("句子收藏与笔记", self.open_notes),
             ("生词复习", self.open_review),
+            ("听写练习（当前文章）", self.open_dictation),
         ])
         action_menu("设置", [("阅读显示与背景", self.open_display)])
         actions.addStretch(1)
@@ -859,7 +860,7 @@ class MainWindow(StudyUi, QMainWindow):
         layout.addWidget(accent)
         layout.addWidget(QLabel("播放速度（单词、句子和全文）"))
         speed = QComboBox()
-        for value in (0.6, 0.75, 0.9, 1.0):
+        for value in (0.6, 0.75, 0.9, 1.0, 1.25):
             speed.addItem(f"{value:g} 倍速", value)
         speed.setCurrentIndex(max(0, speed.findData(self.audio_speed)))
         layout.addWidget(speed)
@@ -933,7 +934,7 @@ class MainWindow(StudyUi, QMainWindow):
             self._show_hint("未找到英文语音，请在 Windows 语言设置中安装英语语音。")
             return
         self.speech.say(text)
-        self.status_label.setText("正在以较慢语速朗读英文，可暂停或停止。")
+        self.status_label.setText(f"正在以 {self.audio_speed:g} 倍速朗读英文，可暂停或停止。")
 
     def pause_speech(self):
         if hasattr(self,'sentence_timer') and self.sentence_timer.isActive():
