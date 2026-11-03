@@ -13,7 +13,7 @@
 - 数据固定存放于 `%USERPROFILE%/Documents/EnglishReadingMarker/reader.sqlite3`，每天首次打开自动快照备份。
 
 ## 版本与下载
-- Windows 桌面版 v1.3.2、Android 版 v1.5 安装包见本仓库 Releases。
+- 最新安装包见 [Releases](https://github.com/rexosen/english-reading-marker/releases)：Windows 桌面版 v1.3.3（听写模式、逐句自评、1.25 倍速）、Android 版 v1.5。
 - 完整演进记录见下方各版本小节。
 
 ## 快速开始
