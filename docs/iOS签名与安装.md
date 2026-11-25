@@ -52,6 +52,13 @@ Build Settings 里加：
 - `iOS Deployment Target = 16.0`
 Info.plist 用 `ios/App/Info.plist` 覆盖即可。
 
+### 零成本云端出包（无需 Mac：GitHub Actions + SideStore / Sideloadly）
+
+仓库已配置 `.github/workflows/build-ios-ipa.yml`：
+1. 每次推送到 `main`（改动 `ios/` 或前端页面）或在 GitHub 仓库 → **Actions → Build iOS IPA (Unsigned) → Run workflow** 手动触发，云端 `macos-15` 会自动下载离线词库、编译未签名 `.app` 并打包成 `EnglishReadingMarker_iOS_v*.ipa`。
+2. 在 Actions 页面的 **Artifacts**（或对应的 GitHub Release）下载 `.ipa` 到 Windows 电脑。
+3. 使用 **Sideloadly**（Windows 直接连数据线装机，每 7 天续签一次）或 **SideStore**（装好后手机在 Wi-Fi 下可直接自动续签，不用每次插电脑），用免费 Apple ID 签名并安装到 iPhone。
+
 ## 3. 装到没连 Mac 的手机
 
 - **免费账号**：7 天后 App 打不开。解决：重连一次 Mac 打开 App；或用

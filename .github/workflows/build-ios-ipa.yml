@@ -1,0 +1,105 @@
+name: Build iOS IPA (Unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "可选：把编好的 .ipa 附加到指定 GitHub Release（例如 v1.4.0），留空则只上传到 Actions Artifact"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - "android/app/src/main/assets/**"
+      - "tools/sync_web_assets.py"
+      - ".github/workflows/build-ios-ipa.yml"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build offline ECDICT dictionary
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ecdict
+          if curl -fSL --retry 3 -o /tmp/ecdict/ecdict.zip \
+            "https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-csv-28.zip"; then
+            unzip -o -q /tmp/ecdict/ecdict.zip -d /tmp/ecdict
+            CSV=$(find /tmp/ecdict -name "*.csv" | head -n 1)
+          else
+            echo "Fallback to ecdict.mini.csv"
+            curl -fSL --retry 3 -o /tmp/ecdict/ecdict.mini.csv \
+              "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.mini.csv"
+            CSV="/tmp/ecdict/ecdict.mini.csv"
+          fi
+          python3 tools/build_dictionary.py "$CSV" android/app/src/main/assets/dictionary.sqlite3
+          ls -lh android/app/src/main/assets/dictionary.sqlite3
+
+      - name: Sync Web assets and prepare SQLite header
+        run: |
+          set -euo pipefail
+          python3 tools/sync_web_assets.py
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cp "$SDK/usr/include/sqlite3.h" ios/CHeaders/sqlite3.h
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Build unsigned iOS app
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project EnglishReadingMarker.xcodeproj \
+            -scheme EnglishReadingMarker \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          VERSION=$(grep 'MARKETING_VERSION:' ios/project.yml | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+          IPA_NAME="EnglishReadingMarker_iOS_v${VERSION}_unsigned.ipa"
+          APP_PATH="ios/build/DerivedData/Build/Products/Release-iphoneos/EnglishReadingMarker.app"
+          test -d "$APP_PATH"
+          rm -rf /tmp/ipa-stage && mkdir -p /tmp/ipa-stage/Payload
+          cp -R "$APP_PATH" /tmp/ipa-stage/Payload/
+          (cd /tmp/ipa-stage && zip -r -q "${GITHUB_WORKSPACE}/${IPA_NAME}" Payload)
+          ls -lh "${IPA_NAME}"
+          echo "IPA_NAME=${IPA_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EnglishReadingMarker-iOS-IPA
+          path: ${{ env.IPA_NAME }}
+          retention-days: 30
+
+      - name: Attach IPA to GitHub Release (if requested or on release)
+        if: ${{ github.event_name == 'release' || inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
+          gh release upload "$TAG" "${IPA_NAME}" --clobber

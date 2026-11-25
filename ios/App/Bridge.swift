@@ -147,6 +147,16 @@ final class Bridge: NSObject, WKScriptMessageHandler {
                 DispatchQueue.main.async { [weak self] in self?.stopAudio() }
                 response = ["ok": true]
 
+            case "clearAudioCache":
+                DispatchQueue.main.async { [weak self] in self?.stopAudio() }
+                var removed = 0
+                if let items = try? FileManager.default.contentsOfDirectory(at: AppPaths.pronunciation, includingPropertiesForKeys: nil) {
+                    for item in items where item.pathExtension == "mp3" || item.pathExtension == "tmp" {
+                        if (try? FileManager.default.removeItem(at: item)) != nil { removed += 1 }
+                    }
+                }
+                response = ["removed": removed]
+
             case "chooseBackground", "importBackup":
                 let wantImage = action == "chooseBackground"
                 DispatchQueue.main.async { [weak self] in
