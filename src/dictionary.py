@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -14,6 +15,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 API_ENDPOINT = "https://api.mymemory.translated.net/get"
+_google_blocked_until = 0.0
 
 class DictionaryError(RuntimeError):
     pass
@@ -52,12 +54,17 @@ def _chunks(text: str, limit: int = 450) -> list[str]:
     return chunks
 
 def _translate_chunk(text: str, timeout: float) -> str:
-    # Google is unreachable on mainland networks; give it a short budget, then fall back.
-    providers = [
-        ("https://translate.googleapis.com/translate_a/single?" + urlencode({"client":"gtx", "sl":"en", "tl":"zh-CN", "dt":"t", "q":text}), min(timeout, 1.5)),
-        (API_ENDPOINT + "?" + urlencode({"q":text, "langpair":"en|zh-CN"}), timeout),
-    ]
-    for url, provider_timeout in providers:
+    global _google_blocked_until
+    # Google is unreachable on mainland networks; remember failures for 10 minutes
+    # so subsequent translations skip straight to MyMemory instead of waiting 1.5s each time.
+    now = time.monotonic()
+    google_url = "https://translate.googleapis.com/translate_a/single?" + urlencode({"client":"gtx", "sl":"en", "tl":"zh-CN", "dt":"t", "q":text})
+    mymemory_url = API_ENDPOINT + "?" + urlencode({"q":text, "langpair":"en|zh-CN"})
+    providers = []
+    if now >= _google_blocked_until:
+        providers.append(("google", google_url, min(timeout, 1.5)))
+    providers.append(("mymemory", mymemory_url, timeout))
+    for name, url, provider_timeout in providers:
         try:
             request = Request(url, headers={"User-Agent":"EnglishReaderMarker/2.0"})
             with urlopen(request, timeout=provider_timeout) as response:
@@ -68,8 +75,13 @@ def _translate_chunk(text: str, timeout: float) -> str:
                 if payload.get("responseStatus") != 200: continue
                 translated = payload.get("responseData", {}).get("translatedText", "")
             translated = html.unescape(translated).strip()
-            if translated and translated.casefold() != text.casefold(): return translated
+            if translated and translated.casefold() != text.casefold():
+                if name == "google":
+                    _google_blocked_until = 0.0
+                return translated
         except (OSError, ValueError, TypeError, IndexError, KeyError):
+            if name == "google":
+                _google_blocked_until = time.monotonic() + 600.0
             continue
     raise DictionaryError("翻译服务未返回可用结果，请检查网络后右键重试。")
 

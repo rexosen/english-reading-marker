@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import URLError
 
+from src import dictionary
 from src.dictionary import DictionaryError, lookup_chinese
 
 
@@ -22,6 +23,7 @@ class FakeResponse:
 
 class DictionaryTests(unittest.TestCase):
     def setUp(self):
+        dictionary._google_blocked_until = 0.0
         self.cache_patch = patch("src.dictionary.cached_translation", return_value=None)
         self.cache_patch.start()
         self.addCleanup(self.cache_patch.stop)

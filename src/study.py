@@ -20,22 +20,65 @@ def study_snapshot(db):
 
 _UNSPECIFIED = object()
 
+def _review_schedule(value):
+    """Validate a review grade and return (grade, due, interval, count)."""
+    if value.get('grade') not in ('again', 'hard', 'known'):
+        raise ValueError('复习评分无效')
+    try:
+        parsed = datetime.fromisoformat(value['due'].replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            raise ValueError()
+        interval = float(value['interval'])
+        if not 0 <= interval <= 365:
+            raise ValueError()
+        count = int(value.get('count', 1))
+        if not 1 <= count <= 100000:
+            raise ValueError()
+    except (ValueError, KeyError, TypeError, OverflowError):
+        raise ValueError('复习时间或间隔无效')
+    return value['grade'], parsed.isoformat(), interval, count
+
+
 def set_study(db, key, value, *, expected=_UNSPECIFIED):
-    if not isinstance(key, str) or len(key) > 220 or not re.fullmatch(r'(group|meta|note|review):[A-Za-z0-9:_-]+', key):
+    if not isinstance(key, str) or len(key) > 220 or not re.fullmatch(r'(group|meta|note|review|vgroup|vcat):[A-Za-z0-9:_~.%-]+', key):
         raise ValueError('学习记录编号无效')
     prefix = key.split(':', 1)[0]
     if value is None:
-        if prefix not in ('note', 'group'):
+        if prefix not in ('note', 'group', 'vgroup', 'vcat'):
             raise ValueError('此类学习记录不能删除')
     else:
         if not isinstance(value, dict) or len(json.dumps(value, ensure_ascii=False)) > 40000:
             raise ValueError('学习记录格式无效或过长')
-        if prefix == 'group':
+        if prefix in ('group', 'vgroup'):
             value = {'name': _text(value.get('name'), 60)}
-            for other in db.execute("SELECT key,value FROM study_items WHERE key LIKE 'group:%' AND key!=?", (key,)):
+            for other in db.execute("SELECT key,value FROM study_items WHERE key LIKE ? AND key!=?", (prefix + ':%', key)):
                 existing = json.loads(other['value'])
                 if existing and existing['name'].casefold() == value['name'].casefold():
                     raise ValueError('已存在同名分组，请选择现有分组或换一个名称')
+        elif prefix == 'vcat':
+            # Vocabulary-book category: one record per word, no article binding, so the
+            # same word keeps its category wherever it was underlined.
+            from src.vocabulary import AUTO_NAMES, GROUP_PREFIX
+            word = _text(value.get('word'), 100)
+            group = value.get('group', '')
+            if not isinstance(group, str):
+                raise ValueError('生词分类无效')
+            if group not in AUTO_NAMES:
+                stored = {row[0] for row in db.execute("SELECT key FROM study_items WHERE key LIKE ?", (GROUP_PREFIX + '%',))}
+                if group not in stored:
+                    raise ValueError('生词分类不存在，请重新选择')
+            value = {'word': word, 'group': group}
+        elif prefix == 'review' and key.startswith('review:manual:'):
+            # Review record of a hand-written word or phrase: keyed by vocabulary id.
+            try:
+                vocabulary_id = int(key.split(':', 2)[2])
+            except (ValueError, IndexError):
+                raise ValueError('复习记录编号无效')
+            if not db.execute('SELECT 1 FROM vocabulary WHERE id=? AND article_id IS NULL', (vocabulary_id,)).fetchone():
+                raise ValueError('复习记录没有对应的自建词条')
+            grade, due, interval, count = _review_schedule(value)
+            value = {'manual': True, 'vocabulary_id': vocabulary_id, 'grade': grade,
+                     'due': due, 'interval': interval, 'count': count}
         else:
             article_id = value.get('article_id')
             row = db.execute('SELECT a.* FROM articles a JOIN sync_articles s ON a.id=s.article_id WHERE s.sync_id=?', (article_id,)).fetchone()
@@ -60,19 +103,8 @@ def set_study(db, key, value, *, expected=_UNSPECIFIED):
                 else:
                     if key != f'review:{article_id}:{start}:{end}' or not db.execute('SELECT 1 FROM vocabulary WHERE article_id=? AND start=? AND end=?', (row['id'], start, end)).fetchone():
                         raise ValueError('复习记录没有对应的生词')
-                    if value.get('grade') not in ('again', 'hard', 'known'):
-                        raise ValueError('复习评分无效')
-                    try:
-                        parsed = datetime.fromisoformat(value['due'].replace('Z', '+00:00'))
-                        if parsed.tzinfo is None:
-                            raise ValueError()
-                        interval = float(value['interval'])
-                        if not 0 <= interval <= 365: raise ValueError()
-                        count = int(value.get('count', 1))
-                        if not 1 <= count <= 100000: raise ValueError()
-                    except (ValueError, KeyError, TypeError, OverflowError):
-                        raise ValueError('复习时间或间隔无效')
-                    value = {'article_id': article_id, 'start': start, 'end': end, 'grade': value['grade'], 'due': parsed.isoformat(), 'interval': interval, 'count': count}
+                    grade, due, interval, count = _review_schedule(value)
+                    value = {'article_id': article_id, 'start': start, 'end': end, 'grade': grade, 'due': due, 'interval': interval, 'count': count}
     if prefix == 'note' and expected is not _UNSPECIFIED:
         current = db.execute('SELECT value FROM study_items WHERE key=?', (key,)).fetchone()
         current = json.loads(current[0]) if current else None
@@ -156,16 +188,23 @@ class StudyRepository:
     def review_cards(self, *, all_cards=False):
         items, now, cards = self.items(), datetime.now(timezone.utc), []
         for word in self.repository.list_vocabulary():
-            sync_id = self.sync_id(word['article_id'])
-            key = f"review:{sync_id}:{word['start']}:{word['end']}"
+            if word['article_id'] is None:
+                # Hand-written entry: reviewed under its own vocabulary id.
+                key = f"review:manual:{word['id']}"
+            else:
+                key = f"review:{self.sync_id(word['article_id'])}:{word['start']}:{word['end']}"
             record = items.get(key)
             if all_cards or not record or datetime.fromisoformat(record['due']) <= now:
-                cards.append({**word, 'key': key, 'record': record, 'sync_id': sync_id})
+                cards.append({**word, 'key': key, 'record': record,
+                              'sync_id': None if word['article_id'] is None else self.sync_id(word['article_id'])})
         return sorted(cards, key=lambda card: (card['record'] or {}).get('due', ''))
 
     def grade(self, card, grade):
         previous = self.items().get(card['key']) or {}
         interval = 0 if grade == 'again' else 1 if grade == 'hard' else min(365, max(3, previous.get('interval', 0) * 2))
         due = datetime.now(timezone.utc) + (timedelta(minutes=10) if grade == 'again' else timedelta(days=interval))
-        self.set(card['key'], {'article_id': card['sync_id'], 'start': card['start'], 'end': card['end'], 'grade': grade,
-                              'interval': interval, 'due': due.isoformat(), 'count': previous.get('count', 0) + 1})
+        schedule = {'grade': grade, 'due': due.isoformat(), 'interval': interval, 'count': previous.get('count', 0) + 1}
+        if card['article_id'] is None:
+            self.set(card['key'], {'manual': True, 'vocabulary_id': card['id'], **schedule})
+            return
+        self.set(card['key'], {'article_id': card['sync_id'], 'start': card['start'], 'end': card['end'], **schedule})

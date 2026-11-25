@@ -1,26 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
-
-from PyInstaller.utils.hooks import copy_metadata
-
-root = os.path.abspath(SPECPATH)
-assets = os.path.join(root, "assets")
-
-datas = [
-    (os.path.join(assets, "Online_Classes_原文.txt"), "assets"),
-    (os.path.join(assets, "ECDICT-LICENSE.txt"), "assets"),
-]
-dictionary = os.path.join(assets, "dictionary.sqlite3")
-if os.path.exists(dictionary):
-    datas.append((dictionary, "assets"))
-datas += copy_metadata("edge-tts")
 
 a = Analysis(
-    [os.path.join(root, "src", "main.py")],
+    ['D:/ChatGPT迁移/工作区产出/Documents-Codex/Project_04_英语阅读标记器/src/main.py'],
     pathex=[],
     binaries=[],
-    datas=datas,
+    datas=[('D:/ChatGPT迁移/工作区产出/Documents-Codex/Project_04_英语阅读标记器/assets/Online_Classes_原文.txt', 'assets'), ('D:/ChatGPT迁移/工作区产出/Documents-Codex/Project_04_英语阅读标记器/assets/dictionary.sqlite3', 'assets'), ('D:/ChatGPT迁移/工作区产出/Documents-Codex/Project_04_英语阅读标记器/assets/ECDICT-LICENSE.txt', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

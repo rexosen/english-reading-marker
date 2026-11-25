@@ -124,6 +124,7 @@ def _prepare_locked(folder, legacy_candidates):
         daily = backups / ('daily_' + datetime.now().strftime('%Y%m%d') + '.sqlite3')
         if not daily.exists():
             backup_database(database, daily)
+            prune_daily_backups(backups)
         return StorageResult(database, False)
     candidates, failures, seen = [], [], set()
     for candidate in (_legacy_paths() if legacy_candidates is None else legacy_candidates):
@@ -220,3 +221,55 @@ def _apply_pending_restore(database):
         restored.commit()
     backup_database(database)
     pending.replace(database)
+
+
+def prune_daily_backups(backups_folder: Path, keep: int = 30) -> int:
+    """Keep the newest ``keep`` daily backups; never touch manual or migration backups."""
+    folder = Path(backups_folder)
+    if not folder.is_dir():
+        return 0
+    dailies = sorted(folder.glob('daily_*.sqlite3'), reverse=True)
+    removed = 0
+    for stale in dailies[keep:]:
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def audio_cache_stats(folder: Path) -> tuple[int, int]:
+    """Return (file_count, total_bytes) for cached word and neural audio."""
+    root = Path(folder)
+    count, total = 0, 0
+    for sub in ('pronunciation', 'neural'):
+        sub_dir = root / sub
+        if not sub_dir.is_dir():
+            continue
+        for item in sub_dir.iterdir():
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                    count += 1
+                except OSError:
+                    pass
+    return count, total
+
+
+def clear_audio_cache(folder: Path) -> int:
+    """Delete cached mp3 files in pronunciation/ and neural/. Returns count removed."""
+    root = Path(folder)
+    removed = 0
+    for sub in ('pronunciation', 'neural'):
+        sub_dir = root / sub
+        if not sub_dir.is_dir():
+            continue
+        for item in sub_dir.iterdir():
+            if item.is_file():
+                try:
+                    item.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed

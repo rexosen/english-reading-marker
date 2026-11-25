@@ -1,7 +1,7 @@
 """Build a signed APK using official Android SDK tools and the local JDK 17."""
 from pathlib import Path
 import argparse,os,secrets,shutil,subprocess,zipfile,ctypes
-root=Path(__file__).resolve().parent.parent
+root=Path(__file__).absolute().parent.parent  # absolute(), not resolve(): keep a substituted ASCII drive letter
 buffer=ctypes.create_unicode_buffer(4096)
 if ctypes.windll.kernel32.GetShortPathNameW(str(root),buffer,4096):root=Path(buffer.value)
 parser=argparse.ArgumentParser()

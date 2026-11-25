@@ -48,9 +48,14 @@ def initialize_sync(path):
           UPDATE sync_articles SET title_version=title_version+1 WHERE article_id=NEW.id;
           INSERT INTO sync_journal(kind) VALUES('article');
         END;
+        CREATE TRIGGER IF NOT EXISTS sync_article_text AFTER UPDATE OF text ON articles WHEN OLD.text != NEW.text BEGIN
+          INSERT INTO sync_journal(kind) VALUES('article');
+        END;
         CREATE TRIGGER IF NOT EXISTS sync_annotation_add AFTER INSERT ON annotations BEGIN INSERT INTO sync_journal(kind) VALUES('annotation'); END;
         CREATE TRIGGER IF NOT EXISTS sync_annotation_remove AFTER DELETE ON annotations BEGIN INSERT INTO sync_journal(kind) VALUES('annotation'); END;
         CREATE TRIGGER IF NOT EXISTS sync_word_add AFTER INSERT ON vocabulary BEGIN INSERT INTO sync_journal(kind) VALUES('vocabulary'); END;
+        CREATE TRIGGER IF NOT EXISTS sync_word_remove AFTER DELETE ON vocabulary BEGIN INSERT INTO sync_journal(kind) VALUES('vocabulary'); END;
+        CREATE TRIGGER IF NOT EXISTS sync_word_change AFTER UPDATE ON vocabulary BEGIN INSERT INTO sync_journal(kind) VALUES('vocabulary'); END;
         """)
         db.commit()
     finally:
@@ -72,13 +77,23 @@ def snapshot(db, client_id):
         del a['local_id']
         articles.append(a)
     conflicts = [dict(r) for r in db.execute('SELECT c.id,s.sync_id AS article_id,c.proposed,a.title AS current_title,s.title_version FROM sync_conflicts c JOIN sync_articles s ON s.article_id=c.article_id JOIN articles a ON a.id=c.article_id WHERE c.client_id=? AND c.resolved=0',(client_id,))]
+    manual = [dict(r) for r in db.execute('SELECT id,word,definition,context,created_at FROM vocabulary WHERE article_id IS NULL ORDER BY id')]
     from src.study import study_snapshot
-    return {'instance':db.execute("SELECT value FROM sync_settings WHERE key='instance'").fetchone()[0], 'revision':revision(db), 'articles':articles, 'conflicts':conflicts, 'study':study_snapshot(db)}
+    return {'instance':db.execute("SELECT value FROM sync_settings WHERE key='instance'").fetchone()[0], 'revision':revision(db), 'articles':articles, 'conflicts':conflicts, 'study':study_snapshot(db), 'vocabulary_manual':manual}
 
 
 def valid_text(value, name, limit=200000):
     if not isinstance(value,str) or not value.strip() or len(value)>limit:
         raise ValueError(name+'为空或超过长度限制')
+    return value.strip()
+
+
+def _free_text(value, limit=20000):
+    """Optional text field: empty is allowed, wrong type or oversize is not."""
+    if value is None:
+        return ''
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError('内容格式无效或超过长度限制')
     return value.strip()
 
 
@@ -95,6 +110,36 @@ def apply_operation(db, op, client_id):
         result = {'id': op_id, 'ok': True, 'stored_key': stored_key}
         db.execute('INSERT INTO sync_operations VALUES (?,?)', (op_id, json.dumps(result)))
         return result
+    if kind in ('vocabulary_manual', 'vocabulary_manual_remove'):
+        # Hand-written words and phrases live in vocabulary with a NULL article_id, so
+        # they are addressed by wording instead of an article position.
+        word = " ".join(valid_text(op.get('word'), '词条', 200).split())
+        if kind == 'vocabulary_manual':
+            definition, context = _free_text(op.get('definition', '')), _free_text(op.get('context', ''))
+            old_raw = op.get('old_word')
+            old_word = " ".join(valid_text(old_raw, '原词条', 200).split()) if old_raw else ''
+            existing = db.execute("SELECT id FROM vocabulary WHERE article_id IS NULL AND word=? COLLATE NOCASE", (word,)).fetchone()
+            if old_word and old_word.casefold() != word.casefold():
+                old_row = db.execute("SELECT id FROM vocabulary WHERE article_id IS NULL AND word=? COLLATE NOCASE", (old_word,)).fetchone()
+                if old_row and not existing:
+                    db.execute("UPDATE vocabulary SET word=?, definition=?, context=? WHERE id=?", (word, definition, context, old_row['id']))
+                elif existing:
+                    db.execute("UPDATE vocabulary SET word=?, definition=?, context=? WHERE id=?", (word, definition, context, existing['id']))
+                    if old_row:
+                        db.execute("DELETE FROM vocabulary WHERE id=?", (old_row['id'],))
+                else:
+                    db.execute("INSERT INTO vocabulary(article_id,start,end,word,definition,context,created_at) "
+                               "VALUES (NULL,NULL,NULL,?,?,?,datetime('now'))", (word, definition, context))
+            elif existing:
+                db.execute("UPDATE vocabulary SET word=?, definition=?, context=? WHERE id=?", (word, definition, context, existing['id']))
+            else:
+                db.execute("INSERT INTO vocabulary(article_id,start,end,word,definition,context,created_at) "
+                           "VALUES (NULL,NULL,NULL,?,?,?,datetime('now'))", (word, definition, context))
+        else:
+            db.execute("DELETE FROM vocabulary WHERE article_id IS NULL AND word=? COLLATE NOCASE", (word,))
+        result = {'id': op_id, 'ok': True}
+        db.execute('INSERT INTO sync_operations VALUES (?,?)', (op_id, json.dumps(result)))
+        return result
     article_sync_id = valid_text(op.get('article_id'),'文章编号',120)
     article = db.execute('SELECT a.*,s.title_version FROM articles a JOIN sync_articles s ON s.article_id=a.id WHERE s.sync_id=?',(article_sync_id,)).fetchone()
     if kind == 'create':
@@ -105,6 +150,15 @@ def apply_operation(db, op, client_id):
             text=normalize_article_text(text)
             cursor=db.execute("INSERT INTO articles(title,text,created_at) VALUES (?,?,datetime('now'))",(title,text))
             db.execute('UPDATE sync_articles SET sync_id=? WHERE article_id=?',(article_sync_id,cursor.lastrowid))
+    elif kind == 'delete':
+        if article is not None:
+            local_id = article['id']
+            db.execute('DELETE FROM sync_conflicts WHERE article_id=?', (local_id,))
+            db.execute('DELETE FROM reading_progress WHERE article_id=?', (local_id,))
+            db.execute('DELETE FROM sync_articles WHERE article_id=?', (local_id,))
+            db.execute('DELETE FROM study_items WHERE key=? OR key LIKE ?', (f'meta:{article_sync_id}', f'review:{article_sync_id}:%'))
+            db.execute('DELETE FROM articles WHERE id=?', (local_id,))
+            db.execute("INSERT INTO sync_journal(kind) VALUES('article')")
     else:
         if article is None: raise ValueError('文章不存在，请先同步')
         local_id=article['id']
@@ -128,6 +182,10 @@ def apply_operation(db, op, client_id):
             offset=op.get('offset')
             if type(offset) is not int or not 0<=offset<=len(article['text']): raise ValueError('阅读位置无效')
             db.execute('INSERT INTO reading_progress VALUES (?,?) ON CONFLICT(article_id) DO UPDATE SET offset=excluded.offset',(local_id,offset))
+        elif kind == 'vocabulary_remove':
+            start,end=op.get('start'),op.get('end')
+            if type(start) is not int or type(end) is not int: raise ValueError('标记位置无效')
+            db.execute('DELETE FROM vocabulary WHERE article_id=? AND start=? AND end=?',(local_id,start,end))
         elif kind in ('underline','vocabulary'):
             start,end=op.get('start'),op.get('end')
             if type(start) is not int or type(end) is not int or not 0<=start<end<=len(article['text']): raise ValueError('标记位置无效')
@@ -241,6 +299,12 @@ class LanSyncService:
                             client_id=valid_text(payload.get('client_id'),'设备编号',100)
                             ops=payload.get('operations',[])
                             if not isinstance(ops,list) or len(ops)>500:raise ValueError('一次最多同步 500 项修改')
+                            client_revision=payload.get('revision')
+                            if not ops and type(client_revision) is int:
+                                current_revision=revision(db)
+                                has_conflicts=db.execute('SELECT 1 FROM sync_conflicts WHERE client_id=? AND resolved=0',(client_id,)).fetchone()
+                                if client_revision==current_revision and not has_conflicts:
+                                    self.respond(200,{'instance':instance,'revision':current_revision,'unchanged':True,'acknowledgements':[]});return
                             # Serialize writes and snapshot reads as one transaction.
                             db.execute('BEGIN IMMEDIATE')
                             acknowledgements=[]

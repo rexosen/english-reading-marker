@@ -54,6 +54,27 @@ const renamed=core.clone(fixture.articles);core.apply(renamed,{type:'rename',art
   await page.locator('[data-page="connect"]').click();await page.locator('[data-choice="mobile"]').click();
   await page.waitForFunction(()=>JSON.parse(localStorage.getItem('reader-v1')).conflicts.length===0&&JSON.parse(localStorage.getItem('reader-v1')).articles[0].title==='Phone title');
   await page.locator('[data-page="vocabulary"]').click();await page.locator('#exportWords').click();assert.ok(csv.includes('Online')&&csv.includes('Phone title'));
+   // 生词本：自建词组、点卡片朗读、分类筛选、删除同步到电脑
+   assert.ok(csv.includes('分类'),'CSV 带分类列');
+   await page.locator('#addPhrase').click();
+   await page.locator('#entryWord').fill('  in   demand ');await page.locator('#entryDefinition').fill('有需求的');
+   await page.locator('#entryContext').fill('Jobs are in demand.');await page.locator('#entrySave').click();
+   await page.waitForFunction(()=>JSON.parse(localStorage.getItem('reader-v1')).vocabulary_manual.some(w=>w.word==='in demand'));
+   await page.locator('[data-page="vocabulary"]').click();
+   await page.locator('.card').filter({hasText:'in demand'}).first().click();
+   assert.equal(spoken,'in demand','点卡片任意位置即朗读');
+   await page.locator('[data-vocab-group]').filter({hasText:'听力'}).first().click();
+   assert.equal(await page.locator('.card').count(),1,'按分类筛选');
+   await page.locator('[data-vocab-group="all"]').click();
+   await page.locator('#exportWords').click();assert.ok(csv.includes('有需求的'),'自建词组进导出');
+   const desktopView=async()=>(await (await fetch(serverUrl+'/sync',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+JSON.parse(localStorage.getItem('reader-v1')).config.token},body:JSON.stringify({client_id:'desktop-check',instance:JSON.parse(localStorage.getItem('reader-v1')).instance,operations:[]})})).json());
+   await page.locator('#syncNow').click();
+   assert.ok((await desktopView()).vocabulary_manual.some(w=>w.word==='in demand'&&w.definition==='有需求的'),'电脑端收到自建词组');
+   page.once('dialog',dialog=>dialog.accept());
+   await page.locator('.card').filter({hasText:'in demand'}).first().locator('[data-delete]').click();
+   await page.waitForFunction(()=>!JSON.parse(localStorage.getItem('reader-v1')).vocabulary_manual.some(w=>w.word==='in demand'));
+   await page.locator('#syncNow').click();
+   assert.ok(!(await desktopView()).vocabulary_manual.some(w=>w.word==='in demand'),'手机上删除后电脑也删掉');
   await page.locator('[data-page="articles"]').click();await page.locator('.openArticle').click();
   await page.evaluate(()=>{const body=document.getElementById('readingArea'),r=document.createRange();r.selectNodeContents(body);const s=window.getSelection();s.removeAllRanges();s.addRange(r);});
   await page.locator('#selectionBar').waitFor({state:'visible'});await page.locator('#selectionTranslate').click();await page.locator('#lookupDefinition').filter({hasText:'测试译文'}).waitFor();await page.locator('#lookupSpeak').click();assert.ok(spoken.includes('Students learn'));assert.equal(speechConfig.accent,'uk');assert.equal(speechConfig.speed,0.6);assert.equal(speechConfig.source,'dictionary');

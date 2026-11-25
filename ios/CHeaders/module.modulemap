@@ -1,0 +1,15 @@
+// 系统 SQLite 的 Clang 模块包装。
+// Swift 里 `import CSQLite` 才能拿到 sqlite3_open_v2 / sqlite3_prepare_v2 等 C API，
+// 对应安卓里 android.database.sqlite 直接可用 —— iOS 没有 SQLite 的 Swift/Objective-C
+// 框架，只有 libsqlite3.tbd + SDK 头文件，所以要手写一个 modulemap。
+//
+// sqlite3.h 不签入仓库：由 ios/build_ios.sh 在构建前从当前 SDK 复制过来
+// （cp "$(xcrun --sdk iphoneos --show-sdk-path)/usr/include/sqlite3.h" ios/CHeaders/），
+// 这样换 Xcode 版本也不会带着一个过期的头文件。
+//
+// [system] + 只读打开，避免被当作用户模块参与增量编译。
+module CSQLite [system] {
+	header "sqlite3.h"
+	link "sqlite3"
+	export *
+}

@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>英语阅读标记器</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.7.0</string>
+	<key>CFBundleVersion</key>
+	<string>8</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.education</string>
+	<!-- 对应安卓 activity 的 windowBackground=splash：先给一屏页面底色，避免 WebView 加载前闪白 -->
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIRequiresFullScreen</key>
+	<false/>
+	<key>UIUserInterfaceStyle</key>
+	<string>Light</string>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
+	<!--
+	  没有这段 scene manifest，UIKit 会退回旧式单窗口模式，
+	  AppDelegate.configurationForConnecting 就不会被调用（表现为启动后黑屏）。
+	  对应安卓 setContentView(WebView) 那种「一个 Activity 一个窗口」的结构。
+	-->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+
+	<!--
+	  对应安卓 AndroidManifest 里的 android:usesCleartextTraffic="true"。
+	  iOS 的等价物是 ATS：桌面同步服务是 http://192.168.x.x:18765 明文，
+	  不加这条例外，所有 /pair /sync /translate /tts 请求会被系统直接拦成
+	  "The network connection was lost"。这里只放开本地网络，不放开通向公网的明文，
+	  比安卓那条更收敛。在线翻译/发音走的是 HTTPS（Google / 有道），不受影响。
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>dict.youdao.com</key>
+			<dict>
+				<key>NSExceptionRequiresForwardSecrecy</key>
+				<false/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+
+	<!-- iOS 18 起访问局域网必须给授权文案，否则首次连电脑直接静默失败 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于通过 Wi-Fi 与电脑上的「英语阅读标记器」同步文章、标注和发音缓存。</string>
+
+	<!-- 相册背景图：PHPicker 在 iOS 14+ 无需此键，保留给 iOS 13 兜底与 UIDocumentPicker -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>用于保存导出的生词表与备份文件。</string>
+
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFTypeName</key>
+			<string>英语阅读标记器备份</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.json</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

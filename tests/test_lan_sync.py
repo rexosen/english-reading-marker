@@ -79,6 +79,28 @@ class LanSyncTests(unittest.TestCase):
         imported=[a for a in result['articles'] if a['id']==article_id]
         self.assertEqual(len(imported),1);self.assertEqual(len(imported[0]['annotations']),1)
 
+    def test_manual_words_travel_outside_articles(self):
+        add={'id':str(uuid.uuid4()),'type':'vocabulary_manual','word':'  in   demand ','definition':'有需求的','context':'Jobs are in demand.'}
+        result=self.sync([add])
+        self.assertEqual([w['word'] for w in result['vocabulary_manual']],['in demand'])
+        self.assertEqual(result['vocabulary_manual'][0]['definition'],'有需求的')
+        self.assertEqual(len(result['articles'][0]['vocabulary']),0,'自建词条不挂到任何文章上')
+        self.sync([add])
+        self.assertEqual(len(self.repo.list_vocabulary()),1)
+        again=self.sync([{'id':str(uuid.uuid4()),'type':'vocabulary_manual','word':'IN DEMAND','definition':'非常抢手'}])
+        self.assertEqual(len(again['vocabulary_manual']),1)
+        self.assertEqual(again['vocabulary_manual'][0]['definition'],'非常抢手')
+        bad=self.sync([{'id':str(uuid.uuid4()),'type':'vocabulary_manual','word':'   '}])
+        self.assertIn('error',bad['acknowledgements'][0])
+        removed=self.sync([{'id':str(uuid.uuid4()),'type':'vocabulary_manual_remove','word':'In  Demand'}])
+        self.assertEqual(removed['vocabulary_manual'],[])
+        self.assertEqual(self.repo.list_vocabulary(),[])
+
+    def test_manual_word_changes_bump_the_revision(self):
+        before=self.repo.sync_revision()
+        self.sync([{'id':str(uuid.uuid4()),'type':'vocabulary_manual','word':'take over','definition':'接管'}])
+        self.assertGreater(self.repo.sync_revision(),before)
+
     def test_invalid_location_and_wrong_instance_do_not_write(self):
         bad=self.op('underline',start=3,end=9,word='wrong',active=True)
         result=self.sync([bad]);self.assertIn('error',result['acknowledgements'][0])

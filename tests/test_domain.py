@@ -1,10 +1,12 @@
 import unittest
 
 from src.domain import (
+    find_selected_phrase,
     find_selected_word,
     normalize_article_text,
     python_offset_to_qt,
     qt_offset_to_python,
+    trim_range,
 )
 
 
@@ -61,6 +63,48 @@ class DomainTests(unittest.TestCase):
 
         self.assertEqual(qt_start, 2)
         self.assertEqual(qt_offset_to_python(text, qt_start), 1)
+
+
+    def test_find_selected_phrase_accepts_multi_word_terms(self):
+        article = "By contrast, fossil fuel plastic was more expensive."
+        start = article.index("fossil fuel")
+
+        self.assertEqual(find_selected_phrase(article, start, start + 11),
+                         (start, start + 11, "fossil fuel"))
+        # 拖选常带首尾空格：范围收到文字本身，位置仍与原文严格对应
+        padded = find_selected_phrase(article, start - 1, start + 12)
+        self.assertEqual(padded, (start, start + 11, "fossil fuel"))
+        self.assertEqual(article[padded[0]:padded[1]], padded[2])
+
+    def test_find_selected_phrase_accepts_hyphens_apostrophes_and_digits(self):
+        for text, term in (("newly-made plastic is cheap", "newly-made plastic"),
+                           ("don't give up now", "don't give up"),
+                           ("the price is mp3 level", "mp3 level"),
+                           ("e.g. recycled plastic works", "e.g. recycled plastic")):
+            start = text.index(term)
+            self.assertEqual(find_selected_phrase(text, start, start + len(term)),
+                             (start, start + len(term), term))
+
+    def test_find_selected_phrase_rejects_sentences_and_partial_words(self):
+        article = "The price increase of recycled plastic could cost sustainable manufacturers an extra year."
+        self.assertIsNone(find_selected_phrase(article, 0, len("The price increase of recycled plastic could cost")))
+        self.assertIsNone(find_selected_phrase(article, 4, 11), "cutting inside a word must not count")
+        self.assertIsNone(find_selected_phrase(article, 5, 9), "'rice' 是从 price 中间截的")
+        self.assertIsNone(find_selected_phrase(article, -1, 5))
+        self.assertIsNone(find_selected_phrase(article, 0, 999))
+        self.assertIsNone(find_selected_phrase("  ", 0, 2))
+        self.assertIsNone(find_selected_phrase("price, increase", 0, len("price, increase")), "标点不算词组")
+
+    def test_find_selected_phrase_honours_the_word_limit(self):
+        text = "one two three four five six seven"
+        self.assertIsNotNone(find_selected_phrase(text, 0, len("one two three four five six")))
+        self.assertIsNone(find_selected_phrase(text, 0, len(text)))
+        self.assertIsNotNone(find_selected_phrase(text, 0, len(text), max_words=7))
+
+    def test_trim_range_skips_surrounding_whitespace(self):
+        text = "  word  "
+        self.assertEqual(trim_range(text, 0, len(text)), (2, 6))
+        self.assertEqual(trim_range("a\n\tb\n", 0, 5), (0, 4))
 
 
 if __name__ == "__main__":

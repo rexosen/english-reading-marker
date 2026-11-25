@@ -1,6 +1,7 @@
 """Desktop learning dialogs and reader controls."""
 from __future__ import annotations
 import hashlib
+import html
 import json
 import uuid
 from pathlib import Path
@@ -15,7 +16,7 @@ from src.domain import python_offset_to_qt, qt_offset_to_python
 from src.dictation import compare
 from src.listening import ListeningReviews
 from src.study import StudyRepository, sentence_ranges
-from src.storage import backup_database, backup_details, schedule_restore
+from src.storage import backup_database, backup_details, schedule_restore, audio_cache_stats, clear_audio_cache
 
 
 class StudyUi:
@@ -36,6 +37,8 @@ class StudyUi:
         self.sentence_timer.setSingleShot(True)
         self.sentence_timer.timeout.connect(self._play_sentence)
         self.speech.stateChanged.connect(self._sentence_speech_state)
+        if hasattr(self, 'neural'):
+            self.neural.stateChanged.connect(self._sentence_speech_state)
         self.reader.set_background_options(self.display_options)
         self.apply_display()
         menu = self.menuBar().addMenu('学习与阅读')
@@ -85,7 +88,7 @@ class StudyUi:
         self.replay_missed = QCheckBox('只重听没听懂句'); self.replay_missed.toggled.connect(self._refresh_listening_label); row2.addWidget(self.replay_missed)
         self.listening_label = QLabel(''); row2.addWidget(self.listening_label); row2.addStretch(1)
         controls_layout.addLayout(row2)
-        self.sentence_label = QLabel('双击正文也可从所在句开始逐句朗读；逐句时可用“听懂/没听懂”标记当前句。')
+        self.sentence_label = QLabel('双击正文也可从所在句开始逐句朗读；逐句时可用“听懂/没听懂”标记当前句。快捷键（焦点在正文时）：空格＝暂停/继续，↑＝上一句，↓＝下一句，←／→＝重复当前句，1＝1 倍速，2＝0.75 倍速。')
         self.sentence_label.setWordWrap(True)
         controls_layout.addWidget(self.sentence_label)
 
@@ -175,10 +178,10 @@ class StudyUi:
         def load():
             queue=session['queue'];card=queue.pop(0) if queue else None;session['card']=card
             for button in buttons:button.setEnabled(False)
-            pronounce.setEnabled(bool(card));reveal.setEnabled(bool(card));jump.setEnabled(bool(card))
+            pronounce.setEnabled(bool(card));reveal.setEnabled(bool(card));jump.setEnabled(bool(card) and card['article_id'] is not None)
             if not card:
                 word.setText('本轮复习完成');source.setText('未到期的生词会在到期后出现，也可以切换到全部生词练习。');content.clear();status.setText(f"本轮已复习 {session['done']} 条");return
-            word.setText(card['word']);source.setText('来源：'+card['article_title']);content.setPlainText(card['context'])
+            word.setText(card['word']);source.setText('来源：'+(card['article_title'] or '自建词条'));content.setPlainText(card['context'])
             status.setText(f"剩余 {len(queue)+1} 条 · 本轮已复习 {session['done']} 条")
         def reset():
             session.update(queue=self.study.review_cards(all_cards=mode.currentData()),done=0);load()
@@ -196,7 +199,7 @@ class StudyUi:
         pronounce.clicked.connect(lambda:self._speak(session['card']['word']) if session['card'] else None)
         def go():
             card=session['card']
-            if card:dialog.accept();self.jump_to_range(card['article_id'],card['start'],card['end'])
+            if card and card['article_id'] is not None:dialog.accept();self.jump_to_range(card['article_id'],card['start'],card['end'])
         jump.clicked.connect(go);reset();dialog.exec()
 
     def save_selected_note(self):
@@ -340,13 +343,77 @@ class StudyUi:
         if not 0<=next_position<len(order):return
         self.stop_audio();self._sentence_index=order[next_position];self._sentence_round=0;self._sentence_active=True;self._play_sentence()
 
+    def keyboard_sentence_step(self, direction):
+        """Up/Down in the reader: begin at the current sentence, then step."""
+        if not self._sentence_active:
+            self.start_sentences()
+            return
+        self.step_sentence(direction)
+
+    def keyboard_sentence_repeat(self):
+        """Left/Right in the reader: replay the current sentence without stepping away."""
+        if not self._sentences:
+            self._sentences = sentence_ranges(self.reader.toPlainText())
+        if not self._sentences:
+            self._show_hint('请先打开一篇文章，再用 ←/→ 重复当前句。')
+            return
+        self._sentence_index = min(max(0, self._sentence_index), len(self._sentences) - 1)
+        if not self._sentence_active:
+            # Nothing is playing (first press, or the sequence already finished): take the
+            # sentence under the caret, which the highlight keeps in sync with the ear.
+            offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
+            self._sentence_index = next((i for i, sentence in enumerate(self._sentences) if sentence[1] > offset),
+                                        min(self._sentence_index, len(self._sentences) - 1))
+        self.stop_audio()
+        self._sentence_active = True
+        self._sentence_round = 0
+        self._refresh_listening_label()
+        self._play_sentence()
+
+    def _reveal_sentence(self, start, end):
+        """Highlight the current sentence and scroll the reader along with it.
+
+        The caret used to be restored to its previous position straight after
+        ``ensureCursorVisible()``, so Qt scrolled back to the *old* caret and the page
+        never followed the sentence being played. The caret now moves with the
+        highlight, and the scroll bar is positioned from the sentence's own line
+        rectangles because ``ensureCursorVisible`` only guarantees the caret line.
+        """
+        reader = self.reader
+        document = reader.document()
+        selection = QTextCursor(document)
+        selection.setPosition(python_offset_to_qt(reader.toPlainText(), start))
+        selection.setPosition(python_offset_to_qt(reader.toPlainText(), end), QTextCursor.MoveMode.KeepAnchor)
+        extra = QTextEdit.ExtraSelection()
+        extra.cursor = selection
+        extra.format.setBackground(QColor('#70ffcc66'))
+        reader.setExtraSelections([extra])
+
+        caret = QTextCursor(document)
+        caret.setPosition(selection.selectionStart())
+        reader.setTextCursor(caret)
+
+        bar = reader.verticalScrollBar()
+        height = reader.viewport().height()
+        if not height:
+            reader.ensureCursorVisible()
+            return
+        padding = max(4, min(28, height // 6))
+        top = reader.cursorRect(caret).top()
+        tail = QTextCursor(document)
+        tail.setPosition(max(selection.selectionStart(), selection.selectionEnd() - 1))
+        bottom = reader.cursorRect(tail).bottom()
+        if top < padding:
+            bar.setValue(bar.value() + top - padding)
+        elif bottom > height - padding:
+            # A sentence taller than the viewport keeps its first line at the top.
+            offset = top - padding if bottom - top > height - 2 * padding else bottom - height + padding
+            bar.setValue(bar.value() + offset)
+
     def _play_sentence(self):
         if not self._sentence_active:return
         start,end,text=self._sentences[self._sentence_index]
-        extra=QTextEdit.ExtraSelection();extra.cursor=QTextCursor(self.reader.document());extra.cursor.setPosition(python_offset_to_qt(self.reader.toPlainText(),start));extra.cursor.setPosition(python_offset_to_qt(self.reader.toPlainText(),end),QTextCursor.MoveMode.KeepAnchor)
-        extra.format.setBackground(QColor('#70ffcc66'));self.reader.setExtraSelections([extra])
-        cursor=self.reader.textCursor();scroll=self.reader.verticalScrollBar().value()
-        self.reader.setTextCursor(extra.cursor);self.reader.ensureCursorVisible();self.reader.setTextCursor(cursor)
+        self._reveal_sentence(start, end)
         self.sentence_label.setText(f'第 {self._sentence_index+1}/{len(self._sentences)} 句 · 第 {self._sentence_round+1}/{self.sentence_repeat.value()} 遍')
         self._sentence_spoken=False;self._speak_system(text)
 
@@ -374,8 +441,9 @@ class StudyUi:
         if not sentences:
             self._show_hint('当前没有打开的文章，或文章正文为空。'); return
         offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
-        state = {'index': next((i for i, s in enumerate(sentences) if s[1] > offset), 0), 'results': []}
+        state = {'index': next((i for i, s in enumerate(sentences) if s[1] > offset), 0), 'results': {}}
         dialog = QDialog(self); dialog.setWindowTitle('听写练习'); dialog.resize(780, 640)
+        dialog.finished.connect(lambda _code: self.stop_audio())
         layout = QVBoxLayout(dialog)
         info = QLabel(); info.setWordWrap(True); layout.addWidget(info)
         typed = QTextEdit(); typed.setPlaceholderText('听一句，敲一句；没听清的词先跳过，对照后再补。'); layout.addWidget(typed, 1)
@@ -402,28 +470,36 @@ class StudyUi:
         result = compare(sentences[state['index']][2], typed.toPlainText())
         parts = []
         for word, status in zip(result['expected'], result['statuses']):
-            if status == 'ok': parts.append(word)
-            elif status == 'wrong': parts.append(f'<b style="color:#c0392b;text-decoration:underline">{word}</b>')
-            else: parts.append(f'<b style="color:#c0392b">[{word}]</b>')
-        extras = f'<br>多写的词：{" ".join(result["extra"])}' if result['extra'] else ''
+            safe = html.escape(word)
+            if status == 'ok': parts.append(safe)
+            elif status == 'wrong': parts.append(f'<b style="color:#c0392b;text-decoration:underline">{safe}</b>')
+            else: parts.append(f'<b style="color:#c0392b">[{safe}]</b>')
+        extras = f'<br>多写的词：{html.escape(" ".join(result["extra"]))}' if result['extra'] else ''
         feedback.setHtml('正确答案：' + ' '.join(parts) + extras + f'<br>本句准确率 {result["accuracy"]*100:.0f}%（红=写错，[红]=漏写）')
-        state['results'].append(result['accuracy'])
-        info.setText(f'第 {state["index"]+1}/{len(sentences)} 句 · 已对照 {len(state["results"])} 句 · 平均准确率 {sum(state["results"])/len(state["results"])*100:.0f}%')
+        state['results'][state['index']] = result['accuracy']
+        scores = list(state['results'].values())
+        info.setText(f'第 {state["index"]+1}/{len(sentences)} 句 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores)/len(scores)*100:.0f}%')
 
     def _dictation_move(self, dialog, sentences, state, typed, feedback, info, direction):
         target = state['index'] + direction
         if target < 0: return
         if target >= len(sentences):
             if state['results']:
-                info.setText(f'全文听写结束 · 已对照 {len(state["results"])} 句 · 平均准确率 {sum(state["results"])/len(state["results"])*100:.0f}%')
+                scores = list(state['results'].values())
+                info.setText(f'全文听写结束 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores)/len(scores)*100:.0f}%')
             else:
                 info.setText('已到最后一句。')
             return
         state['index'] = target; self._dictation_show(sentences, state, typed, feedback, info); self._dictation_play(sentences, state)
 
     def open_backup_manager(self):
-        dialog=QDialog(self);dialog.setWindowTitle('数据与备份恢复');dialog.resize(760,590);layout=QVBoxLayout(dialog)
-        label=QLabel('资料位置：'+str(self.repository.database_path.parent)+'\n每天首次打开自动备份；恢复前还会保存当前资料。');label.setWordWrap(True);layout.addWidget(label)
+        dialog=QDialog(self);dialog.setWindowTitle('数据与备份恢复');dialog.resize(760,610);layout=QVBoxLayout(dialog)
+        label=QLabel('资料位置：'+str(self.repository.database_path.parent)+'\n每天首次打开自动备份（自动保留最近 30 份每日快照）；恢复前还会保存当前资料。');label.setWordWrap(True);layout.addWidget(label)
+        cache_label=QLabel();layout.addWidget(cache_label)
+        def refresh_cache_label():
+            count, size = audio_cache_stats(self.repository.database_path.parent)
+            cache_label.setText(f'本地语音缓存：{count} 个音频文件（{size / 1048576:.1f} MB）')
+        refresh_cache_label()
         listing=QListWidget();layout.addWidget(listing,1);detail=QTextBrowser();layout.addWidget(detail,1)
         def add(path):
             try:
@@ -458,8 +534,14 @@ class StudyUi:
                 schedule_restore(Path(d['path']),self.repository.database_path)
             except Exception as error:QMessageBox.warning(dialog,'恢复未执行',str(error));return
             dialog.accept();self.close();self.application_quit()
+        def clean_cache():
+            if QMessageBox.question(dialog,'清理语音缓存','删除本地缓存的词典发音与神经网络语音文件？\n不影响文章、划线和生词，下次朗读时按需重新下载。')!=QMessageBox.StandardButton.Yes:return
+            self.stop_audio()
+            removed=clear_audio_cache(self.repository.database_path.parent)
+            refresh_cache_label()
+            QMessageBox.information(dialog,'清理完成',f'已清理 {removed} 个缓存音频文件。')
         row=QHBoxLayout()
-        for title,action in [('立即备份',backup),('选择备份文件',choose),('恢复所选并退出',restore)]:
+        for title,action in [('立即备份',backup),('选择备份文件',choose),('清理语音缓存',clean_cache),('恢复所选并退出',restore)]:
             button=QPushButton(title);button.clicked.connect(action);row.addWidget(button)
         layout.addLayout(row);listing.currentItemChanged.connect(show);refresh();dialog.exec()
 

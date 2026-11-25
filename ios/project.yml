@@ -1,0 +1,78 @@
+# XcodeGen 工程描述（等价于安卓的 build.gradle + AndroidManifest 合一）。
+# 为什么用 XcodeGen 而不提交 .xcodeproj：
+#   1. .pbxproj 是机器生成的巨型 XML，和 WebResources 一样属于产物，进仓库必然冲突；
+#   2. 页面资源来自 android/app/src/main/assets，由 Tools/sync_web_assets.py 同步，
+#      工程文件写成声明式，换台 Mac `xcodegen generate` 就还原，和安卓那条「单一真源」保持一致。
+# 用法：brew install xcodegen && cd ios && xcodegen generate   （细节见 ios/README.md）
+
+name: EnglishReadingMarker
+
+options:
+  bundleIdPrefix: cn.readingdesk
+  deploymentTarget:
+    iOS: "16.0"          # 安卓 minSdk 26(Android 8)；iOS 16 是能同时用上
+                         # PHPicker + isInspectable + NWListener 的最低稳定版本
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"      # 构建脚本要往 WebResources 里放同步资源
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_OPTIMIZATION_LEVEL: -O
+    DEAD_CODE_STRIPPING: "YES"
+
+targets:
+  EnglishReadingMarker:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        # Info.plist / entitlements 不能被当作资源塞进 bundle（安卓 assets 里没有这种坑）
+        excludes:
+          - "Info.plist"
+          - "*.entitlements"
+      - path: Resources
+      # 页面与词库：与安卓共用同一份源文件，由 Tools/sync_web_assets.py 生成
+      - path: WebResources
+        buildPhase: resources
+        group: WebResources
+      # sqlite3.h + module.modulemap 只要参与头搜索路径，不要进 Sources 编译
+      - path: CHeaders
+        buildPhase: none
+        includes:
+          - "module.modulemap"
+          - "sqlite3.h"
+    settings:
+      base:
+        PRODUCT_NAME: EnglishReadingMarker
+        PRODUCT_BUNDLE_IDENTIFIER: cn.readingdesk.reader.ios
+        PRODUCT_DISPLAY_NAME: 英语阅读标记器
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/EnglishReadingMarker.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"          # iPhone + iPad（安卓那套 layoutlib 也只区分手机/平板）
+        CURRENT_PROJECT_VERSION: "8"           # 对齐安卓 versionCode
+        MARKETING_VERSION: "1.7.0"             # 对齐安卓 versionName
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/CHeaders
+        HEADER_SEARCH_PATHS: $(SRCROOT)/CHeaders
+        # 对应安卓「本地 SQLite」：iOS 不需要打包 sqlcipher，用系统 libsqlite3 就够
+        OTHER_LDFLAGS: $(inherited) -lsqlite3
+        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOL_EXTENSIONS: "YES"
+        ENABLE_BITCODE: "NO"                   # Xcode 14+ 已不支持 bitcode
+        VALID_ARCHS: arm64
+      configs:
+        Debug:
+          CODE_SIGN_IDENTITY: Apple Development
+          ONLY_ACTIVE_ARCH: "YES"
+        Release:
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+    preBuildScripts:
+      - name: 同步 Web 资源（等价安卓 assets 合并步骤）
+        script: |
+          set -euo pipefail
+          # 仓库里的目录是小写 tools/；macOS 大小写敏感，路径别写错
+          python3 "${SRCROOT}/../tools/sync_web_assets.py" --quiet || \
+            echo "warning: WebResources 未刷新，沿用上次同步的副本"
+        basedOnDependencyAnalysis: false

@@ -8,3 +8,12 @@ work/
 assets/dictionary.sqlite3
 android/app/src/main/assets/dictionary.sqlite3
 .coverage
+
+# iOS 构建产物（与安卓 build/outputs 同性质，不入库）
+# WebResources 由 tools/sync_web_assets.py 从安卓 assets 生成，其中 60 MB 词库本来就被忽略
+ios/WebResources/
+ios/CHeaders/sqlite3.h
+ios/*.xcodeproj/
+ios/DerivedData/
+xcshareddata/xcdebugger/
+*.xcuserstate

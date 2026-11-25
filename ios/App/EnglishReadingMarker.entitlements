@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  对照安卓 AndroidManifest 的权限清单：
+
+	  android.permission.INTERNET                  → iOS 无需 entitlement，联网默认可用；
+	                                                   本地网络另由 NSLocalNetworkUsageDescription 管
+	  android.permission.WRITE_EXTERNAL_STORAGE    → iOS 沙盒内不需要，导出走 UIDocumentPicker(forExporting:)
+	  <uses-permission android:name="...INTERNET"> / READ_MEDIA_IMAGES
+	                                               → 相册改用 PHPicker，无需读相册权限
+
+	  所以这个文件几乎是空的：本 App 不用推送、不用 App Groups、不用 Sign in with Apple。
+	  留着它是为了让 project.yml 的 entitlements 指向一个真实文件，
+	  Release 打包（上架）时把 get-task-allow 改成 false 即可。
+	-->
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
+</dict>
+</plist>

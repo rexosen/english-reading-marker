@@ -7,6 +7,7 @@ from pathlib import Path
 CSV_COLUMNS = [
     ("单词", "word"),
     ("中文释义", "definition"),
+    ("分类", "category_name"),
     ("原句", "context"),
     ("文章", "article_title"),
     ("标记日期", "created_at"),

@@ -6,6 +6,7 @@ let state;
 try{state=JSON.parse(localStorage.getItem('reader-v1')||'null');}catch(error){alert('本地数据无法读取，请保留 App 数据并联系修复。');throw error;}
 if(!state)state={client_id:uuid(),instance:null,articles:[],outbox:[],conflicts:[],errors:[],config:{url:'',token:''},translations:{}};
 if(!state.study)state.study={};
+if(!Array.isArray(state.vocabulary_manual))state.vocabulary_manual=[];
 if(!state.display)state.display={size:21,line:1.75,width:780,margin:18,theme:'paper',image:'',opacity:22};
 if(!state.audio)state.audio={accent:'us',speed:0.75,source:'dictionary'};
 let page='articles',activeId=null,selected=null,currentDefinition='',lookupSequence=0,busy=false,lastSync='',lastError='',restoring=false;
@@ -26,7 +27,7 @@ function enqueue(type,fields){
  const before=SyncCore.clone(state),op={id:uuid(),type,...fields};
  // Only coalesce unsent progress. An in-flight request can still acknowledge its own ID.
  if(type==='progress')state.outbox=state.outbox.filter(x=>!(x.type==='progress'&&x.article_id===op.article_id));
- state.outbox.push(op);SyncCore.apply(state.articles,op,state.study);
+ state.outbox.push(op);SyncCore.apply(state.articles,op,state.study,state.vocabulary_manual);
  try{save();}catch(error){state=before;throw error;}
  updateStatus();return op;
 }
@@ -42,7 +43,14 @@ async function sync(manual=false){
  if(!state.config.token){if(manual){navigate('connect');toast('先连接电脑，再开始同步');}return;}
  busy=true;updateStatus();
  try{
-  const response=await nativeCall('sync',{url:state.config.url,token:state.config.token,body:{client_id:state.client_id,instance:state.instance,operations:SyncCore.clone(operationBatch())}});
+  const batch=operationBatch();
+  const response=await nativeCall('sync',{url:state.config.url,token:state.config.token,body:{client_id:state.client_id,instance:state.instance,revision:batch.length?null:(state.revision??null),operations:SyncCore.clone(batch)}});
+  if(response.unchanged){
+   if(typeof response.revision==='number')state.revision=response.revision;
+   lastError='';lastSync=new Date().toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+   if(manual)toast(state.conflicts.length?'已同步，请在连接页面处理名称冲突':'已是最新');
+   return;
+  }
   // Merge against the current state, including edits made during the request.
   const previous=state;state=SyncCore.merge(state,response);
   try{save();}catch(error){state=previous;throw error;}
@@ -92,7 +100,13 @@ function renderPaste(){
 }
 function renderReader(){
  const a=article();if(!a){navigate('articles');return;}
- $('main').innerHTML='<h2 id="readingTitle"></h2><div class="readControls"><div class="actions"><button id="speakAll" class="small">▶ 全文朗读</button><button id="pauseSpeech" class="small">暂停 / 继续</button><button id="stopSpeech" class="small">停止</button></div><div class="muted">点单词查义；长按拖选句段，再点下方“翻译”。</div></div><div id="sentenceControls"></div><article id="readingArea"></article>';
+ $('main').innerHTML='<h2 id="readingTitle"></h2><div class="readControls"><div class="actions"><button id="speakAll" class="small">▶ 全文朗读</button><button id="pauseSpeech" class="small">暂停 / 继续</button><button id="stopSpeech" class="small">停止</button><button id="quickSpeed" class="small"></button></div><div class="muted">点单词查义；长按拖选句段，再点下方“翻译”。</div></div><div id="sentenceControls"></div><article id="readingArea"></article>';
+ const refreshQuickSpeed=()=>{if($('quickSpeed'))$('quickSpeed').textContent='🔊 '+state.audio.speed+' 倍速';};
+ refreshQuickSpeed();
+ $('quickSpeed').onclick=()=>{
+  const next=Math.abs(Number(state.audio.speed)-0.75)<1e-6?1:0.75;
+  state.audio={...state.audio,speed:next};save();refreshQuickSpeed();toast('已切换 '+next+' 倍速（点顶部“发音”可改口音与其他倍速）');
+ };
  $('readingTitle').textContent=a.title;
  const pattern=/[A-Za-z]+(?:['’\-][A-Za-z]+)*/g;let html='',last=0,match;
  while((match=pattern.exec(a.text))){
@@ -147,25 +161,151 @@ function mark(){
 }
 function saveWord(){
  if(!selected)return;
- if(!/^[A-Za-z]+(?:['’\-][A-Za-z]+)*$/.test(selected.word)){toast('生词本请只选一个单词；句段可以翻译和朗读');return;}
+ const phrase=selected.word.trim();
+ // 与桌面端一致：单词和短词组都能记，长句留给翻译与朗读。
+ if(!/^[A-Za-z][A-Za-z'’.\- ]*$/.test(phrase)||phrase.split(/\s+/).length>6){toast('生词本可记单词或最多 6 个词的词组；更长的句段请翻译或朗读');return;}
  if(!currentDefinition){openLookup();toast('查询到释义后，再点击加入生词本');return;}
  const a=state.articles.find(a=>a.id===selected.article_id),chars=Array.from(a.text);
  const context=chars.slice(Math.max(0,selected.start-70),Math.min(chars.length,selected.end+120)).join('');
  enqueue('vocabulary',{...selected,definition:currentDefinition,context});toast('已加入生词本');sync();
 }
 function speak(text){stopSequence();if(text)nativeCall('speak',{text,...state.audio}).catch(error=>toast(error.message));}
+let vocabularyGroup='all',vocabularyQuery='';
+function vocabularyCounts(){
+ const words=allWords(),tally=new Map();
+ words.forEach(w=>tally.set(w.category,(tally.get(w.category)||0)+1));
+ return tally;
+}
+function filteredVocabularyWords(){
+ const words=allWords(),q=vocabularyQuery.trim().toLowerCase();
+ return words.filter(w=>{
+  if(vocabularyGroup!=='all'&&w.category!==vocabularyGroup)return false;
+  if(!q)return true;
+  return [w.word,w.definition,w.context,w.article_title].join(' ').toLowerCase().includes(q);
+ });
+}
 function renderVocabulary(){
- const words=state.articles.flatMap(a=>a.vocabulary.map(w=>({...w,article_id:a.id,article_title:a.title})));
- $('main').innerHTML='<div class="row actions"><h2 class="grow">生词本 · '+words.length+'</h2><button id="reviewWords">复习卡片</button><button id="exportWords">导出 CSV</button></div>'+(words.length?words.map((w,i)=>'<section class="card"><div class="row"><div class="title grow">'+esc(w.word)+'</div><button class="small pronounce" data-index="'+i+'">▶ 发音</button></div><div style="white-space:pre-wrap;line-height:1.7">'+esc(w.definition)+'</div><p class="muted">'+esc(w.article_title)+'<br>'+esc(w.context)+'</p></section>').join(''):'<div class="empty">阅读时点单词查义，再加入生词本。</div>');
- document.querySelectorAll('.pronounce').forEach(button=>button.onclick=()=>speak(words[+button.dataset.index].word));
+ const words=allWords(),tally=vocabularyCounts();
+ if(vocabularyGroup!=='all'&&vocabularyGroup!==''&&!vocabCategories().some(g=>g.key===vocabularyGroup))vocabularyGroup='all';
+ const chips=[{key:'all',name:'全部'}].concat(vocabCategories()).concat([{key:'',name:'未分类'}])
+  .map(g=>({key:g.key,name:g.name||'未分类',count:g.key==='all'?words.length:(g.key===''?words.filter(w=>!w.category).length:(tally.get(g.key)||0))}));
+ $('main').innerHTML='<div class="row actions"><h2 class="grow">生词本 · '+words.length+'</h2><button id="reviewWords">复习卡片</button><button id="exportWords">导出 CSV</button></div>'
+  +'<div class="actions"><button id="addPhrase" class="primary">＋ 加入词组</button><button id="manageVocabGroups">分类管理</button></div>'
+  +'<input id="vocabSearch" placeholder="搜索单词、释义、例句或文章">'
+  +'<div class="tabs">'+chips.map(g=>'<button data-vocab-group="'+esc(g.key)+'"'+(String(vocabularyGroup)===String(g.key)?' class="active"':'')+'>'+esc(g.name)+' '+g.count+'</button>').join('')+'</div>'
+  +'<div id="vocabCards"></div>'
+  +'<p class="muted">点卡片任意位置就朗读；✎ 是自己录入的词组，可编辑。标题以“听力:/阅读:”开头的文章里的生词自动进这两类，手动分类优先。删除会与电脑同步。</p>';
+ $('vocabSearch').value=vocabularyQuery;
+ function renderCards(){
+  const visible=filteredVocabularyWords();
+  const card=(w,index)=>'<section class="card" data-speak-row="'+index+'"><div class="row"><div class="title grow">'+(w.manual?'✎ ':'')+esc(w.word)+'</div>'+(w.category?'<span class="muted">'+esc(vocabCategoryName(w.category))+'</span>':'')+'</div>'
+   +'<div style="white-space:pre-wrap;line-height:1.7">'+esc(w.definition||'暂无释义')+'</div>'
+   +'<p class="muted">'+esc(w.article_title||'自建词条（自己录入的单词或词组）')+(w.context?'<br>'+esc(w.context):'')+'</p>'
+   +'<div class="actions"><button class="small" data-speak="'+index+'">▶ 朗读</button><button class="small" data-group="'+index+'">分类</button>'
+   +(w.manual?'<button class="small" data-edit="'+index+'">编辑</button>':'')+'<button class="small" data-delete="'+index+'">删除</button></div></section>';
+  $('vocabCards').innerHTML=visible.length?visible.map((w,index)=>card(w,index)).join(''):'<div class="empty">'+(words.length?'当前筛选或搜索下没有生词，试试清空搜索或点“全部”。':'阅读时点单词查义即可加入生词本，也可以点“＋ 加入词组”自己写词组、释义和例句。')+'</div>';
+  document.querySelectorAll('[data-speak-row]').forEach(row=>row.onclick=event=>{
+   if(event.target.closest('button'))return;
+   speak(visible[+row.dataset.speakRow].word);
+  });
+  document.querySelectorAll('[data-speak]').forEach(button=>button.onclick=()=>speak(visible[+button.dataset.speak].word));
+  document.querySelectorAll('[data-group]').forEach(button=>button.onclick=()=>vocabularyGroupPicker(visible[+button.dataset.group]));
+  document.querySelectorAll('[data-edit]').forEach(button=>button.onclick=()=>vocabularyEntryEditor(visible[+button.dataset.edit]));
+  document.querySelectorAll('[data-delete]').forEach(button=>button.onclick=()=>deleteVocabularyWord(visible[+button.dataset.delete]));
+ }
+ $('vocabSearch').oninput=()=>{vocabularyQuery=$('vocabSearch').value;renderCards();};
+ document.querySelectorAll('[data-vocab-group]').forEach(button=>button.onclick=()=>{vocabularyGroup=button.dataset.vocabGroup;renderVocabulary();});
+ $('addPhrase').onclick=()=>vocabularyEntryEditor(null);
+ $('manageVocabGroups').onclick=manageVocabularyGroups;
  $('reviewWords').onclick=()=>{reviewSession=null;navigate('review');};
  $('exportWords').onclick=()=>{
-  if(!words.length){toast('生词本为空');return;}
+  const visible=filteredVocabularyWords();
+  if(!visible.length){toast('当前筛选下没有可导出的生词');return;}
   const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
-  const rows=[['单词','中文释义','来源文章','原句'],...words.map(w=>[w.word,w.definition,w.article_title,w.context])];
+  const rows=[['单词','中文释义','分类','来源文章','原句'],...visible.map(w=>[w.word,w.definition,vocabCategoryName(w.category),w.article_title||'自建词条',w.context])];
   nativeCall('export',{csv:rows.map(row=>row.map(quote).join(',')).join('\r\n')}).catch(error=>toast(error.message));
  };
+ renderCards();
 }
+function deleteVocabularyWord(word){
+ const label=SyncCore.normalizeWord(word.word);
+ if(!confirm('从生词本删除“'+label+'”？\n\n只删生词记录，文章里的划线保留；同步后电脑上也会删掉。'))return;
+ if(word.manual)enqueue('vocabulary_manual_remove',{word:label});
+ else enqueue('vocabulary_remove',{article_id:word.article_id,start:word.start,end:word.end,word:label});
+ sync();renderVocabulary();toast('已删除，联网后与电脑同步');
+}
+function vocabularyGroupPicker(word){
+ const overlay=document.createElement('div');overlay.className='overlay';
+ const current=vocabCategoryOf(word.word,word.manual?null:state.articles.find(a=>a.id===word.article_id));
+ overlay.innerHTML='<section class="sheet"><h3>'+esc(word.word)+'</h3><label>分类</label><select id="vocabPick"><option value="">自动（按文章标题）</option>'
+  +vocabCategories().map(g=>'<option value="'+esc(g.key)+'">'+esc(g.name)+'</option>').join('')
+  +'<option value="__new">＋ 新建分类…</option></select><div class="actions"><button id="vocabPickSave" class="primary">保存</button><button id="vocabPickClose">关闭</button></div></section>';
+ document.body.appendChild(overlay);$('vocabPick').value=current||'';
+ $('vocabPickSave').onclick=()=>{
+  let key=$('vocabPick').value;
+  if(key==='__new'){overlay.remove();key=vocabCreateCategory(prompt('新分类名称（最多60字）')||'');if(!key){renderVocabulary();return;}}
+  vocabAssign(word.word,key);overlay.remove();renderVocabulary();toast(key?'已归入“'+vocabCategoryName(key)+'”':'已恢复按文章自动分类');
+ };
+ $('vocabPickClose').onclick=()=>{overlay.remove();renderVocabulary();};
+ overlay.onclick=event=>{if(event.target===overlay)$('vocabPickClose').onclick();};
+}
+function vocabularyEntryEditor(word){
+ const editing=!!word;
+ const overlay=document.createElement('div');overlay.className='overlay';
+ overlay.innerHTML='<section class="sheet"><h3>'+(editing?'编辑词条':'加入单词或词组')+'</h3><label>单词或词组</label><input id="entryWord" placeholder="例如：in demand、take over" value="'+esc(word?word.word:'')+'">'
+  +'<label>中文释义</label><textarea id="entryDefinition" placeholder="写你自己记得住的说法">'+esc(word?word.definition:'')+'</textarea>'
+  +'<label>例句或用法（可选）</label><textarea id="entryContext">'+esc(word?word.context:'')+'</textarea>'
+  +'<label>分类</label><select id="entryGroup"><option value="">自动（按文章标题）</option>'+vocabCategories().map(g=>'<option value="'+esc(g.key)+'">'+esc(g.name)+'</option>').join('')+'</select>'
+  +'<div class="actions"><button id="entrySave" class="primary">保存</button><button id="entryClose">取消</button></div>'
+  +'<p class="muted">词组可以写多个单词；保存后点卡片即可朗读，同步后电脑生词本里也会出现（前面带 ✎）。</p></section>';
+ document.body.appendChild(overlay);
+ if(editing&&word.category)$('entryGroup').value=word.category;
+ $('entrySave').onclick=()=>{
+  const clean=SyncCore.normalizeWord($('entryWord').value);
+  if(!clean){toast('请先写单词或词组');return;}
+  if(Array.from(clean).length>200){toast('词条太长（最多200字）');return;}
+  const definition=$('entryDefinition').value.trim(),context=$('entryContext').value.trim(),group=$('entryGroup').value;
+  if(editing){
+   const renamed=!SyncCore.sameWord(word.word,clean);
+   if(renamed&&allWords().some(existing=>existing.manual&&!SyncCore.sameWord(existing.word,word.word)&&SyncCore.sameWord(existing.word,clean))){toast('“'+clean+'”已经在生词本里了');return;}
+   enqueue('vocabulary_manual',renamed?{word:clean,old_word:word.word,definition,context}:{word:clean,definition,context});
+   // 分类记录按写法编号，改名时要一起搬过去
+   if(renamed){vocabAssign(word.word,'');if(group)vocabAssign(clean,group);}
+   else if(group!==(word.category||''))vocabAssign(clean,group);
+  }else{
+   if(allWords().some(existing=>SyncCore.sameWord(existing.word,clean))){toast('“'+clean+'”已经在生词本里了');return;}
+   enqueue('vocabulary_manual',{word:clean,definition,context});
+   if(group)vocabAssign(clean,group);
+  }
+  overlay.remove();sync();renderVocabulary();toast('已保存，点词条即可朗读');
+ };
+ $('entryClose').onclick=()=>{overlay.remove();renderVocabulary();};
+ overlay.onclick=event=>{if(event.target===overlay)$('entryClose').onclick();};
+}
+function manageVocabularyGroups(){
+ const overlay=document.createElement('div');overlay.className='overlay';
+ function refresh(){
+  overlay.innerHTML='<section class="sheet"><h3>生词分类</h3><div class="muted">“听力”“阅读”按文章标题自动生成，不能改名或删除。</div><div id="vocabGroupList">'
+   +vocabCategories().map(g=>'<div class="row actions"><span class="grow">'+esc(g.name)+(VOCAB_AUTO_NAMES[g.key]?'（内置）':'')+'</span>'
+    +(VOCAB_AUTO_NAMES[g.key]?'':'<button data-rename-vgroup="'+esc(g.key)+'">改名</button><button data-delete-vgroup="'+esc(g.key)+'">删除</button>')+'</div>').join('')
+   +'</div><div class="actions"><button id="addVocabGroup" class="primary">新建分类</button><button id="closeVocabGroups">完成</button></div></section>';
+  $('addVocabGroup').onclick=()=>{const name=prompt('分类名称（最多60字）');if(name===null)return;const key=vocabCreateCategory(name);if(key)refresh();};
+  $('closeVocabGroups').onclick=()=>{overlay.remove();renderVocabulary();};
+  overlay.querySelectorAll('[data-rename-vgroup]').forEach(button=>button.onclick=()=>{
+   const key=button.dataset.renameVgroup,name=prompt('分类名称',vocabCategoryName(key));
+   if(name===null)return;const clean=SyncCore.normalizeWord(name);
+   if(!clean||Array.from(clean).length>60){toast('请输入1–60字的分类名称');return;}
+   const clash=vocabCategories().find(g=>g.key!==key&&g.name.toLowerCase()===clean.toLowerCase());
+   if(clash){toast('已存在同名分类');return;}
+   studySet(key,{name:clean});refresh();
+  });
+  overlay.querySelectorAll('[data-delete-vgroup]').forEach(button=>button.onclick=()=>{
+   if(confirm('删除分类后，里面的生词按文章标题重新自动归类。继续？')){if(vocabDeleteCategory(button.dataset.deleteVgroup))refresh();}
+  });
+ }
+ document.body.appendChild(overlay);refresh();
+}
+
 function renderConnect(){
  $('main').innerHTML='<h2>连接电脑</h2><section class="card"><div class="muted">1. 两台设备连接同一个 Wi-Fi / 路由器。<br>2. 电脑点击“手机同步”，开启服务并生成配对码。<br>3. 填写电脑显示的地址和配对码。</div><label>电脑地址</label><input id="serverUrl" type="url" inputmode="url" autocomplete="off" placeholder="http://192.168.1.10:18765"><label>一次性配对码</label><input id="pairCode" type="text" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="6 位数字"><div class="actions"><button id="pairButton" class="primary">配对并同步</button><button id="retrySync">立即同步</button></div><div id="pairMessage" class="muted"></div></section><section class="card muted">'+(state.config.token?'已保存配对信息。':'尚未配对。')+'联网时每 3 秒尝试同步；电脑关机或离开局域网后，修改先留在手机，恢复连接后补传。<br>此版本使用家庭局域网 HTTP 连接，请在可信任的网络中使用。<br>系统英文朗读取决于已安装的英文语音包。</section><div id="conflicts"></div>';
  $('serverUrl').value=state.config.url;
@@ -205,7 +345,18 @@ function restoreProgress(){
  const token=tokens.find(token=>+token.dataset.end>=a.progress);if(token&&a.progress>0)token.scrollIntoView({block:'start'});
  setTimeout(()=>restoring=false,350);
 }
-window.handleBack=()=>{if(!$('audioOverlay').hidden){$('audioOverlay').hidden=true;return;}if(!$('lookupOverlay').hidden){$('closeLookup').click();return;}if(page==='read'||page==='paste')navigate('articles');else if(page!=='articles')navigate('articles');else toast('按系统主页键可返回桌面');};
+window.handleBack=()=>{
+ const dynamicOverlays=Array.from(document.querySelectorAll('.overlay')).filter(el=>el.id!=='audioOverlay'&&el.id!=='lookupOverlay'&&!el.hidden);
+ if(dynamicOverlays.length){
+  const top=dynamicOverlays[dynamicOverlays.length-1];
+  const closer=top.querySelector('#dictationClose,#closeOptions,#closeGroups,#closeVocabGroups,#vocabPickClose,#entryClose');
+  if(closer)closer.click();else top.remove();
+  return;
+ }
+ if(!$('audioOverlay').hidden){$('audioOverlay').hidden=true;return;}
+ if(!$('lookupOverlay').hidden){$('closeLookup').click();return;}
+ if(page==='read'||page==='paste')navigate('articles');else if(page!=='articles')navigate('articles');else toast('按系统主页键可返回桌面');
+};
 document.querySelectorAll('[data-page]').forEach(button=>button.onclick=()=>navigate(button.dataset.page));
 $('syncNow').onclick=()=>sync(true);
 $('audioSettings').onclick=()=>{

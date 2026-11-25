@@ -6,6 +6,63 @@ function studySet(key,value,expected=state.study[key]??null){enqueue('study',{ke
 function groups(){return Object.entries(state.study).filter(([key,value])=>key.startsWith('group:')&&value).map(([id,value])=>({id,name:value.name}));}
 function metadata(a){return state.study['meta:'+a.id]||{article_id:a.id,group:'',pinned:false,read:false};}
 function setMetadata(a,fields){studySet('meta:'+a.id,{...metadata(a),...fields});}
+/* ---- 生词分类：与桌面 src/vocabulary.py 同一套规则 ---- */
+const VOCAB_AUTO={listening:'vgroup:auto:listening',reading:'vgroup:auto:reading'};
+const VOCAB_AUTO_NAMES={'vgroup:auto:listening':'听力','vgroup:auto:reading':'阅读'};
+// Python 的 quote(word, safe='') 只留 A-Za-z0-9-._~，其余按 %XX 编码；这里对齐它，
+// 否则 don't 之类的词在两台设备上会算出不同的记录编号。
+function pyQuote(value){return encodeURIComponent(value).replace(/[!'()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());}
+function vocabWordKey(word){return 'vcat:'+pyQuote(SyncCore.normalizeWord(word).toLowerCase());}
+function vocabCategories(){
+ const custom=Object.entries(state.study)
+  .filter(([key,value])=>key.startsWith('vgroup:')&&value&&!VOCAB_AUTO_NAMES[key]&&value.name)
+  .map(([key,value])=>({key,name:String(value.name)}));
+ return [{key:VOCAB_AUTO.listening,name:'听力'},{key:VOCAB_AUTO.reading,name:'阅读'}].concat(custom);
+}
+function vocabCategoryName(key){return (vocabCategories().find(g=>g.key===key)||{}).name||'';}
+function vocabAutoCategory(title,groupName){
+ const match=/^\s*(听力|阅读|listening|reading)\s*[:：]/i.exec(title||'');
+ const map={'听力':VOCAB_AUTO.listening,'阅读':VOCAB_AUTO.reading,'listening':VOCAB_AUTO.listening,'reading':VOCAB_AUTO.reading};
+ if(match)return map[match[1].toLowerCase()]||'';
+ const name=SyncCore.normalizeWord(groupName).toLowerCase().replace(/\s+/g,'');
+ return name==='听力'||name==='listening'?VOCAB_AUTO.listening:name==='阅读'||name==='reading'?VOCAB_AUTO.reading:'';
+}
+function vocabCategoryOf(word,article){
+ const assigned=state.study[vocabWordKey(word)];
+ const known=assigned&&assigned.group&&vocabCategories().some(g=>g.key===assigned.group);
+ if(known)return assigned.group;
+ return article?vocabAutoCategory(article.title,article.group_name||''):'';
+}
+function vocabAssign(word,key){studySet(vocabWordKey(word),key?{word:SyncCore.normalizeWord(word),group:key}:null);}
+function vocabCreateCategory(name){
+ const clean=SyncCore.normalizeWord(name);
+ if(!clean||Array.from(clean).length>60){toast('请输入1–60字的分类名称');return '';}
+ const existing=vocabCategories().find(g=>g.name.toLowerCase()===clean.toLowerCase());
+ if(existing)return existing.key;
+ if(Object.values(VOCAB_AUTO_NAMES).some(label=>label.toLowerCase()===clean.toLowerCase()))return vocabCategories().find(g=>g.name.toLowerCase()===clean.toLowerCase())?.key||'';
+ const key='vgroup:'+uuid();studySet(key,{name:clean});return key;
+}
+function vocabDeleteCategory(key){
+ if(VOCAB_AUTO_NAMES[key]){toast('“听力”和“阅读”是内置分类，不能删除');return false;}
+ studySet(key,null);
+ Object.keys(state.study).filter(k=>k.startsWith('vcat:')&&state.study[k]&&state.study[k].group===key).forEach(k=>studySet(k,null));
+ return true;
+}
+function groupNames(){return new Map(groups().map(g=>[g.id,g.name]));}
+function allWords(){
+ const names=groupNames();
+ const fromArticles=state.articles.flatMap(a=>{
+  const article={...a,group_name:names.get(metadata(a).group)||''};
+  return a.vocabulary.map(w=>({...w,article_id:a.id,article_title:a.title,manual:false,
+   key:'review:'+a.id+':'+w.start+':'+w.end,category:vocabCategoryOf(w.word,article)}));
+ });
+ const fromManual=(state.vocabulary_manual||[]).map(w=>({word:w.word,definition:w.definition||'',context:w.context||'',
+  id:w.id??null,article_id:null,article_title:'',manual:true,start:null,end:null,
+  key:w.id?`review:manual:${w.id}`:'review:local:'+pyQuote(SyncCore.normalizeWord(w.word).toLowerCase()),
+  category:vocabCategoryOf(w.word,null)}));
+ return fromArticles.concat(fromManual);
+}
+
 function renderLearningLibrary(){
  $('main').innerHTML='<div class="row actions"><h2 class="grow">我的文章</h2><button id="newArticle">＋ 粘贴</button></div><input id="articleQuery" placeholder="搜索标题或正文"><div class="actions"><select id="libraryGroup" style="flex:1"></select><button id="manageGroups">管理分组</button><button data-local-page="backups">资料备份</button></div><div id="articleCards"></div>';
  $('articleQuery').value=libraryQuery;
@@ -31,13 +88,18 @@ function renderArticleCards(){
 function articleOptions(id){
  const a=state.articles.find(a=>a.id===id),m=metadata(a);
  const overlay=document.createElement('div');overlay.className='overlay';
- overlay.innerHTML='<section class="sheet"><h3>'+esc(a.title)+'</h3><label>分组</label><select id="articleGroup"><option value="">未分组</option>'+groups().map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+'</option>').join('')+'</select><div class="actions"><button id="saveGroup">保存分组</button><button id="togglePin">'+(m.pinned?'取消置顶':'置顶')+'</button><button id="toggleRead">'+(m.read?'标为未读':'标为已读')+'</button><button id="renameArticle">重命名</button><button id="closeOptions">关闭</button></div></section>';
+ overlay.innerHTML='<section class="sheet"><h3>'+esc(a.title)+'</h3><label>分组</label><select id="articleGroup"><option value="">未分组</option>'+groups().map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+'</option>').join('')+'</select><div class="actions"><button id="saveGroup">保存分组</button><button id="togglePin">'+(m.pinned?'取消置顶':'置顶')+'</button><button id="toggleRead">'+(m.read?'标为未读':'标为已读')+'</button><button id="renameArticle">重命名</button><button id="deleteArticle">删除文章</button><button id="closeOptions">关闭</button></div></section>';
  document.body.appendChild(overlay);$('articleGroup').value=m.group;
  const close=()=>{overlay.remove();renderArticleCards();};
  $('saveGroup').onclick=()=>{setMetadata(a,{group:$('articleGroup').value});close();};
  $('togglePin').onclick=()=>{setMetadata(a,{pinned:!m.pinned});close();};
  $('toggleRead').onclick=()=>{setMetadata(a,{read:!m.read});close();};
- $('renameArticle').onclick=()=>{overlay.remove();rename(id);};$('closeOptions').onclick=close;
+ $('renameArticle').onclick=()=>{overlay.remove();rename(id);};
+ $('deleteArticle').onclick=()=>{
+  if(!confirm('确定删除《'+a.title+'》？\n\n该文章的划线与源自本文的生词会一并删除（自建词条不受影响），同步后电脑上也会删掉。'))return;
+  overlay.remove();if(activeId===id)activeId=null;enqueue('delete',{article_id:id});sync();renderLearningLibrary();toast('文章已删除');
+ };
+ $('closeOptions').onclick=close;
  overlay.onclick=e=>{if(e.target===overlay)close();};
 }
 function manageMobileGroups(){
@@ -50,18 +112,23 @@ function manageMobileGroups(){
  function edit(key){const name=prompt('分组名称（最多60字）',key?state.study[key].name:'');if(name===null)return;if(!name.trim()||name.trim().length>60){toast('请输入1–60字的分组名称');return;}if(groups().some(g=>g.id!==key&&g.name.toLowerCase()===name.trim().toLowerCase())){toast('已存在同名分组');return;}studySet(key||'group:'+uuid(),{name:name.trim()});refresh();}
  document.body.appendChild(overlay);refresh();
 }
-function allWords(){return state.articles.flatMap(a=>a.vocabulary.map(w=>({...w,article_id:a.id,article_title:a.title,key:'review:'+a.id+':'+w.start+':'+w.end})));}
 function renderReview(){
  if(!reviewSession)reviewSession={all:false,queue:allWords().filter(w=>!state.study[w.key]||Date.parse(state.study[w.key].due)<=Date.now()),done:0};
  const card=reviewSession.queue[0];
- $('main').innerHTML='<div class="actions"><button id="reviewBack">返回生词本</button><button id="reviewAll">'+(reviewSession.all?'只复习到期词':'练习全部生词')+'</button></div><div class="muted">剩余 '+reviewSession.queue.length+' 条 · 本轮已复习 '+reviewSession.done+' 条</div>'+(card?'<section class="card"><div class="reviewWord">'+esc(card.word)+'</div><div class="muted">来源：'+esc(card.article_title)+'</div><p class="reviewContext">'+esc(card.context)+'</p><div class="actions"><button id="cardSound">▶ 发音</button><button id="cardOriginal">回原文</button><button id="revealCard" class="primary">显示释义</button></div><div id="cardAnswer" hidden class="noteText">'+esc(card.definition)+'</div><div id="cardGrades" class="actions" hidden><button data-grade="again">不认识 · 10分钟</button><button data-grade="hard">模糊 · 1天</button><button data-grade="known">认识 · 延长间隔</button></div></section>':'<section class="card"><h2>本轮复习完成</h2><p>未到期的词会在到期后出现，也可以练习全部生词。</p></section>')+'<p class="muted">认识：首次3天，再按上次间隔翻倍，最多365天。复习结果可与电脑同步。</p>';
+ $('main').innerHTML='<div class="actions"><button id="reviewBack">返回生词本</button><button id="reviewAll">'+(reviewSession.all?'只复习到期词':'练习全部生词')+'</button></div><div class="muted">剩余 '+reviewSession.queue.length+' 条 · 本轮已复习 '+reviewSession.done+' 条</div>'+(card?'<section class="card"><div class="reviewWord">'+esc(card.word)+'</div><div class="muted">来源：'+esc(card.article_title||'自建词条')+(card.category?' · '+esc(vocabCategoryName(card.category)):'')+'</div><p class="reviewContext">'+esc(card.context)+'</p><div class="actions"><button id="cardSound">▶ 发音</button>'+(card.manual?'':'<button id="cardOriginal">回原文</button>')+'<button id="revealCard" class="primary">显示释义</button></div><div id="cardAnswer" hidden class="noteText">'+esc(card.definition)+'</div><div id="cardGrades" class="actions" hidden><button data-grade="again">不认识 · 10分钟</button><button data-grade="hard">模糊 · 1天</button><button data-grade="known">认识 · 延长间隔</button></div></section>':'<section class="card"><h2>本轮复习完成</h2><p>未到期的词会在到期后出现，也可以练习全部生词。</p></section>')+'<p class="muted">认识：首次3天，再按上次间隔翻倍，最多365天。复习结果可与电脑同步。</p>';
  $('reviewBack').onclick=()=>navigate('vocabulary');$('reviewAll').onclick=()=>{const all=!reviewSession.all;reviewSession={all,queue:allWords().filter(w=>all||!state.study[w.key]||Date.parse(state.study[w.key].due)<=Date.now()),done:0};renderReview();};
  if(!card)return;
- $('cardSound').onclick=()=>speak(card.word);$('cardOriginal').onclick=()=>jumpMobile(card.article_id,card.start,card.end);
+ $('cardSound').onclick=()=>speak(card.word);
+ if(!card.manual)$('cardOriginal').onclick=()=>jumpMobile(card.article_id,card.start,card.end);
  $('revealCard').onclick=()=>{$('cardAnswer').hidden=false;$('cardGrades').hidden=false;};
  document.querySelectorAll('[data-grade]').forEach(b=>b.onclick=()=>{
   const grade=b.dataset.grade,previous=state.study[card.key]||{},interval=grade==='again'?0:grade==='hard'?1:Math.min(365,Math.max(3,(previous.interval||0)*2));
-  studySet(card.key,{article_id:card.article_id,start:card.start,end:card.end,grade,interval,due:new Date(Date.now()+(grade==='again'?600000:interval*86400000)).toISOString(),count:(previous.count||0)+1});
+  const due=new Date(Date.now()+(grade==='again'?600000:interval*86400000)).toISOString(),count=(previous.count||0)+1;
+  if(card.manual){
+   // 自建词条按生词编号记分；还没同步到编号时先记在本机，同步后由电脑接管。
+   const record=card.id?{manual:true,vocabulary_id:card.id,grade,interval,due,count}:{grade,interval,due,count};
+   if(card.id)studySet(card.key,record);else{state.study[card.key]=record;save();toast('该词条尚未同步编号，复习结果先记在本机');}
+  }else studySet(card.key,{article_id:card.article_id,start:card.start,end:card.end,grade,interval,due,count});
   reviewSession.queue.shift();reviewSession.done++;renderReview();
  });
 }
@@ -209,9 +276,11 @@ function backupMobile(kind='manual'){
  try{localStorage.setItem('reader-backups-v1',JSON.stringify(backups));}catch(e){throw Error('备份空间不足，请先导出备份文件再释放空间；没有替换当前资料');}
  return snapshot;
 }
-function backupCounts(data){return data.articles.length+'篇文章 · '+data.articles.reduce((sum,a)=>sum+a.annotations.length,0)+'处划线 · '+data.articles.reduce((sum,a)=>sum+a.vocabulary.length,0)+'条生词 · '+Object.entries(data.study||{}).filter(([k,v])=>k.startsWith('note:')&&v).length+'条收藏';}
+function backupCounts(data){return data.articles.length+'篇文章 · '+data.articles.reduce((sum,a)=>sum+a.annotations.length,0)+'处划线 · '+allWordsIn(data).length+'条生词 · '+Object.entries(data.study||{}).filter(([k,v])=>k.startsWith('note:')&&v).length+'条收藏';}
+function allWordsIn(data){return (data.articles||[]).reduce((sum,a)=>sum+(a.vocabulary||[]).length,0)+(data.vocabulary_manual||[]).length;}
 function validateBackup(data){
  if(!data||!Array.isArray(data.articles)||!Array.isArray(data.outbox)||!data.config||typeof data.client_id!=='string'||data.articles.length>10000||data.outbox.length>50000)throw Error('不是有效的阅读器备份');
+ if(data.vocabulary_manual&&!Array.isArray(data.vocabulary_manual))throw Error('自建词条格式不正确');
  const ids=new Set();for(const a of data.articles){if(!a||typeof a.id!=='string'||ids.has(a.id)||typeof a.title!=='string'||typeof a.text!=='string'||!Array.isArray(a.annotations)||!Array.isArray(a.vocabulary))throw Error('备份文章结构不完整');ids.add(a.id);const text=Array.from(a.text);for(const mark of [...a.annotations,...a.vocabulary])if(!Number.isInteger(mark.start)||!Number.isInteger(mark.end)||mark.start<0||mark.end>text.length||mark.end<=mark.start||text.slice(mark.start,mark.end).join('')!==mark.word)throw Error('备份标记位置与原文不符');}
  if(state.instance&&data.instance&&state.instance!==data.instance)throw Error('备份属于其他电脑的资料库，已阻止覆盖当前手机资料');
  if(data.study&&(typeof data.study!=='object'||Array.isArray(data.study)))throw Error('学习记录格式不正确');
@@ -220,13 +289,14 @@ function validateBackup(data){
 function restoreMobile(data){
  validateBackup(data);if(busy){toast('正在同步，请同步结束后再恢复');return;}
  if(!confirm('恢复为这份备份？\n'+backupCounts(data)+'\n\n会先保存当前资料副本。恢复后的待同步修改会继续发送给电脑。'))return;
- backupMobile('before-restore');const previous=state,next=SyncCore.clone(data);next.config=previous.config.token?previous.config:next.config;next.study=next.study||{};next.display=next.display||previous.display;next.audio=next.audio||previous.audio;next.translations=next.translations||{};next.errors=[];next.conflicts=next.conflicts||[];
+ backupMobile('before-restore');const previous=state,next=SyncCore.clone(data);next.config=previous.config.token?previous.config:next.config;next.study=next.study||{};next.vocabulary_manual=Array.isArray(next.vocabulary_manual)?next.vocabulary_manual:[];next.display=next.display||previous.display;next.audio=next.audio||previous.audio;next.translations=next.translations||{};next.errors=[];next.conflicts=next.conflicts||[];
  state=next;try{save();}catch(e){state=previous;throw e;}stopLearningSpeech();lastSync='';navigate('articles');toast('已恢复手机本机资料；联网同步会按电脑当前资料与待传操作合并');
 }
 function renderBackups(){
- $('main').innerHTML='<h2>手机资料备份与恢复</h2><section class="card"><p>当前：'+esc(backupCounts(state))+'</p><div class="actions"><button id="makeBackup">立即备份到本机</button><button id="exportBackup">导出备份文件</button><button id="importBackup">选择文件恢复</button></div><p class="muted">每天首次打开自动保存快照，最多保留7份本机快照。完整文件可另存到你选择的位置。手机备份格式为JSON，电脑备份为SQLite，请分别使用。\n手机恢复只影响本机；再次联网会与电脑合并，不能用它撤销电脑上的数据。</p></section><div id="backupCards"></div>';
+ $('main').innerHTML='<h2>手机资料备份与恢复</h2><section class="card"><p>当前：'+esc(backupCounts(state))+'</p><div class="actions"><button id="makeBackup">立即备份到本机</button><button id="exportBackup">导出备份文件</button><button id="importBackup">选择文件恢复</button><button id="clearAudioCache">清理语音缓存</button></div><p class="muted">每天首次打开自动保存快照，最多保留7份本机快照。完整文件可另存到你选择的位置。手机备份格式为JSON，电脑备份为SQLite，请分别使用。\n手机恢复只影响本机；再次联网会与电脑合并，不能用它撤销电脑上的数据。</p></section><div id="backupCards"></div>';
  function refresh(){const backups=backupList();$('backupCards').innerHTML=backups.map((b,i)=>'<section class="card"><div class="title">'+esc(new Date(b.time).toLocaleString())+'</div><p>'+esc(backupCounts(b.data))+'</p><p class="muted">'+esc(b.data.articles.map(a=>a.title).join('、'))+'</p><button data-restore-backup="'+i+'">恢复这份快照</button></section>').join('');document.querySelectorAll('[data-restore-backup]').forEach(b=>b.onclick=()=>{try{restoreMobile(backups[+b.dataset.restoreBackup].data);}catch(e){toast(e.message);}});}
  $('makeBackup').onclick=()=>{try{backupMobile();refresh();toast('备份已保存');}catch(e){toast(e.message);}};
+ $('clearAudioCache').onclick=async()=>{if(!confirm('清理本机缓存的词典发音与整句语音文件？不影响文章与生词。'))return;try{const res=await nativeCall('clearAudioCache',{});toast('已清理 '+(res.removed||0)+' 个语音缓存文件');}catch(e){toast(e.message);}};
  $('exportBackup').onclick=async()=>{try{const data=SyncCore.clone(state);data.config={url:data.config.url,token:''};await nativeCall('exportBackup',{data:JSON.stringify({format:'readingdesk-mobile',version:2,created_at:new Date().toISOString(),data})});toast('请选择文件保存位置');}catch(e){toast(e.message);}};
  $('importBackup').onclick=async()=>{try{const result=await nativeCall('importBackup',{});if(result.cancelled)return;const payload=JSON.parse(result.data);if(payload.format!=='readingdesk-mobile'||payload.version!==2)throw Error('不是此版本的手机备份文件');restoreMobile(payload.data);}catch(e){toast(e.message);}};refresh();
 }
@@ -255,11 +325,11 @@ function openDictation(){
  const ranges=splitSentences(a.text);if(!ranges.length){toast('这篇文章没有可用于听写的句子');return;}
  stopSequence();
  const position=selected&&selected.article_id===a.id?selected.start:0;
- const session={index:Math.max(0,ranges.findIndex(s=>s.end>position)),results:[]};
+ const session={index:Math.max(0,ranges.findIndex(s=>s.end>position)),results:{}};
  const overlay=document.createElement('div');overlay.className='overlay';
  overlay.innerHTML='<section class="sheet"><div class="row"><h3 class="grow">听写练习</h3><button class="small" id="dictationClose">关闭</button></div><div id="dictationInfo" class="muted"></div><textarea id="dictationTyped" placeholder="听一句，敲一句；没听清的词先跳过，对照后再补。" style="min-height:90px"></textarea><div class="actions"><button class="small" id="dictationPrev">上一句</button><button class="small" id="dictationPlay">▶ 播放本句</button><button class="small" id="dictationCheck">对照答案</button><button class="small primary" id="dictationNext">下一句 ▶</button></div><div id="dictationResult" class="muted" style="line-height:2"></div></section>';
  document.body.appendChild(overlay);
- const close=()=>overlay.remove();
+ const close=()=>{nativeCall('stop',{}).catch(()=>{});overlay.remove();};
  $('dictationClose').onclick=close;
  overlay.onclick=event=>{if(event.target===overlay)close();};
  const info=$('dictationInfo'),typed=$('dictationTyped'),result=$('dictationResult');
@@ -267,12 +337,13 @@ function openDictation(){
  function play(){nativeCall('speak',{text:ranges[session.index].text,...state.audio}).catch(e=>toast(e.message));}
  function check(){const cmp=dictationCompare(ranges[session.index].text,typed.value);
   const parts=cmp.expected.map((w,idx)=>cmp.statuses[idx]==='ok'?esc(w):cmp.statuses[idx]==='wrong'?'<b style="color:#c0392b;text-decoration:underline">'+esc(w)+'</b>':'<b style="color:#c0392b">['+esc(w)+']</b>');
-  session.results.push(cmp.accuracy);
-  const avg=session.results.reduce((x,y)=>x+y,0)/session.results.length;
-  result.innerHTML='正确答案：'+parts.join(' ')+(cmp.extra.length?'<br>多写的词：'+esc(cmp.extra.join(' ')):'')+'<br>本句准确率 '+(cmp.accuracy*100).toFixed(0)+'% · 已对照 '+session.results.length+' 句平均 '+(avg*100).toFixed(0)+'%（红=写错，[红]=漏写）';}
+  session.results[session.index]=cmp.accuracy;
+  const scores=Object.values(session.results);
+  const avg=scores.reduce((x,y)=>x+y,0)/scores.length;
+  result.innerHTML='正确答案：'+parts.join(' ')+(cmp.extra.length?'<br>多写的词：'+esc(cmp.extra.join(' ')):'')+'<br>本句准确率 '+(cmp.accuracy*100).toFixed(0)+'% · 已对照 '+scores.length+' 句平均 '+(avg*100).toFixed(0)+'%（红=写错，[红]=漏写）';}
  function move(direction){const target=session.index+direction;
   if(target<0)return;
-  if(target>=ranges.length){info.textContent='全文听写结束 · 已对照 '+session.results.length+' 句'+(session.results.length?' · 平均准确率 '+(session.results.reduce((x,y)=>x+y,0)/session.results.length*100).toFixed(0)+'%':'');return;}
+  if(target>=ranges.length){const scores=Object.values(session.results);info.textContent='全文听写结束 · 已对照 '+scores.length+' 句'+(scores.length?' · 平均准确率 '+(scores.reduce((x,y)=>x+y,0)/scores.length*100).toFixed(0)+'%':'');return;}
   session.index=target;show();play();}
  $('dictationPrev').onclick=()=>move(-1);$('dictationNext').onclick=()=>move(1);
  $('dictationPlay').onclick=play;$('dictationCheck').onclick=check;

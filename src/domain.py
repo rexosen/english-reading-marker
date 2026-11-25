@@ -5,6 +5,43 @@ import re
 
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:(?:['’][A-Za-z]+)|(?:-[A-Za-z]+))*\Z")
 
+# 单词或短词组：首字符是字母，词内允许数字、撇号、连字符和点（mp3、don't、e.g.）。
+PHRASE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9'’.\-]*(?:[ \t]+[A-Za-z][A-Za-z0-9'’.\-]*)*")
+
+
+def trim_range(text: str, start: int, end: int) -> tuple[int, int]:
+    """Shrink a range so it skips surrounding whitespace."""
+    left, right = start, end
+    while left < right and text[left].isspace():
+        left += 1
+    while right > left and text[right - 1].isspace():
+        right -= 1
+    return left, right
+
+
+def find_selected_phrase(text: str, start: int, end: int, max_words: int = 6) -> tuple[int, int, str] | None:
+    """Return the selected English word or short phrase, or None.
+
+    The range is trimmed to the wording itself, so callers can always store
+    ``text[start:end] == word`` against the article positions. Whole words only: a
+    selection that cuts inside a word, or that reads like a sentence, is rejected.
+    """
+    if start < 0 or end > len(text) or start >= end:
+        return None
+    left, right = trim_range(text, start, end)
+    if left >= right:
+        return None
+    selected = text[left:right]
+    if not PHRASE_PATTERN.fullmatch(selected):
+        return None
+    if len(selected.split()) > max_words:
+        return None
+    if left > 0 and (text[left - 1].isalpha() or text[left - 1] in "'’-"):
+        return None
+    if right < len(text) and (text[right].isalpha() or text[right] in "'’-"):
+        return None
+    return left, right, selected
+
 
 def normalize_line_endings(text: str) -> str:
     """Convert Windows and legacy line endings to the one Qt expects."""

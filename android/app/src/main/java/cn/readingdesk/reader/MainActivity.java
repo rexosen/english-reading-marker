@@ -373,15 +373,24 @@ public class MainActivity extends Activity {
                     }else if(action.equals("pause")){
                         runOnUiThread(()->{onlinePaused=!onlinePaused;if(wordPlayer!=null){try{if(wordPlayer.isPlaying()){wordPlayer.pause();notice("已暂停");}else{wordPlayer.start();notice("继续发音");}}catch(Exception ignored){}return;}if(paused){paused=false;utterance="speech-"+System.nanoTime();speakFromOffset();notice("继续朗读");}else if(tts.isSpeaking()){paused=true;utterance="paused";tts.stop();notice("已暂停");}});response.put("ok",true);
                     }else if(action.equals("stop")){runOnUiThread(()->stopAudio());response.put("ok",true);
+                    }else if(action.equals("clearAudioCache")){
+                        runOnUiThread(()->stopAudio());
+                        int removed=0;
+                        File folder=new File(getFilesDir(),"pronunciation");
+                        File[] files=folder.listFiles();
+                        if(files!=null){for(File f:files){if(f.isFile()&&f.delete())removed++;}}
+                        response.put("removed",removed);
                     }else if(action.equals("chooseBackground")||action.equals("importBackup")){
-                        if(!pendingFileRequest.isEmpty())throw new IOException("已有文件选择窗口，请先完成或取消");
-                        pendingFileRequest=id;
+                        synchronized(MainActivity.this){
+                            if(!pendingFileRequest.isEmpty())throw new IOException("已有文件选择窗口，请先完成或取消");
+                            pendingFileRequest=id;
+                        }
                         runOnUiThread(()->{
                             try{
                                 Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.addCategory(Intent.CATEGORY_OPENABLE);
                                 intent.setType(action.equals("chooseBackground")?"image/*":"application/json");
                                 startActivityForResult(intent,action.equals("chooseBackground")?43:44);
-                            }catch(Exception error){String waiting=pendingFileRequest;pendingFileRequest="";JSONObject failure=new JSONObject();try{failure.put("error","无法打开文件选择器");}catch(Exception ignored){}reply(waiting,failure);}
+                            }catch(Exception error){String waiting;synchronized(MainActivity.this){waiting=pendingFileRequest;pendingFileRequest="";}JSONObject failure=new JSONObject();try{failure.put("error","无法打开文件选择器");}catch(Exception ignored){}reply(waiting,failure);}
                         });
                         return;
                     }else if(action.equals("exportBackup")){
@@ -424,14 +433,20 @@ public class MainActivity extends Activity {
             });return;
         }
         if(request==45&&result==RESULT_OK&&data!=null&&data.getData()!=null){
-            try(OutputStream output=getContentResolver().openOutputStream(data.getData())){output.write(pendingBackup.getBytes(StandardCharsets.UTF_8));notice("完整备份文件已导出");}
-            catch(Exception error){notice("备份导出失败，请重新选择位置");}
-            pendingBackup=null;return;
+            final Uri uri=data.getData();final String payload=pendingBackup;pendingBackup=null;
+            if(payload!=null)executor.execute(()->{
+                try(OutputStream output=getContentResolver().openOutputStream(uri)){output.write(payload.getBytes(StandardCharsets.UTF_8));notice("完整备份文件已导出");}
+                catch(Exception error){notice("备份导出失败，请重新选择位置");}
+            });
+            return;
         }
         if(request==42&&result==RESULT_OK&&data!=null&&data.getData()!=null){
-            try(OutputStream output=getContentResolver().openOutputStream(data.getData())){
-                output.write(("\ufeff"+pendingCsv).getBytes(StandardCharsets.UTF_8));notice("CSV 已导出");
-            }catch(Exception error){notice("导出失败，请重新选择保存位置");}
+            final Uri uri=data.getData();final String payload=pendingCsv;pendingCsv=null;
+            if(payload!=null)executor.execute(()->{
+                try(OutputStream output=getContentResolver().openOutputStream(uri)){
+                    output.write(("\ufeff"+payload).getBytes(StandardCharsets.UTF_8));notice("CSV 已导出");
+                }catch(Exception error){notice("导出失败，请重新选择保存位置");}
+            });
         }
     }
     @Override public void onBackPressed(){web.evaluateJavascript("window.handleBack()",null);}
