@@ -72,7 +72,7 @@ jobs:
 
       - name: Generate Xcode project
         working-directory: ios
-        run: xcodegen generate --spec project.yml --no-cache --verbose
+        run: xcodegen generate --spec project.yml
 
       - name: Build unsigned iOS app
         working-directory: ios
