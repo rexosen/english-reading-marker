@@ -44,12 +44,12 @@ final class DictionaryStore {
         if handle != nil { return }
 
         // 1) 先试直连 bundle，成功就不用拷 58 MB
-        if let source = locateInBundle(), open(source) { return }
+        if let source = Self.locateInBundle(), open(source) { return }
 
         // 2) 失败再走安卓那条老路：拷到 Application Support
         let fm = FileManager.default
         if !fm.fileExists(atPath: Self.copiedURL.path) {
-            guard let source = locateInBundle() else {
+            guard let source = Self.locateInBundle() else {
                 onUnavailable("本地词库尚不可用，可继续尝试在线翻译"); return
             }
             let staging = AppPaths.support.appendingPathComponent("dictionary.tmp")
@@ -61,7 +61,7 @@ final class DictionaryStore {
                 var values = URLResourceValues()
                 values.isExcludedFromBackup = true
                 var url = Self.copiedURL
-                try? url.setValues(values)
+                try? url.setResourceValues(values)
             } catch {
                 try? fm.removeItem(at: staging)
                 // 上一步直连失败，这里也没有可打开的文件

@@ -110,16 +110,16 @@ final class SpeechEngine: NSObject, AVSpeechSynthesizerDelegate {
             owner?.notice("继续朗读")
         } else if synthesizer.isSpeaking {
             paused = true
-            synthesizer.stop(at: .word)
+            synthesizer.stopSpeaking(at: .word)
             owner?.notice("已暂停")
         }
     }
 
     /// 对应 action=stop / stopAudio() 的系统部分
     func stop() {
-        playbackTokens.bump()
+        _ = playbackTokens.bump()
         generation = playbackTokens.current
-        if synthesizer.isSpeaking { synthesizer.stop(at: .immediate) }
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
         paused = false
         speechOffset = 0
         baseOffset = 0
@@ -128,7 +128,7 @@ final class SpeechEngine: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func pauseForBackground() {
-        if synthesizer.isSpeaking { paused = true; synthesizer.stop(at: .word) }
+        if synthesizer.isSpeaking { paused = true; synthesizer.stopSpeaking(at: .word) }
     }
 
     // MARK: - AVSpeechSynthesizerDelegate
@@ -137,7 +137,7 @@ final class SpeechEngine: NSObject, AVSpeechSynthesizerDelegate {
                            willSpeakRangeOfSpeechString characterRange: NSRange,
                            utterance: AVSpeechUtterance) {
         guard generation == playbackTokens.current else { return }
-        let local = max(0, min(characterRange.location, (utterance.sentence ?? "").count))
+        let local = max(0, min(characterRange.location, utterance.speechString.count))
         speechOffset = baseOffset + local
     }
 
@@ -148,16 +148,6 @@ final class SpeechEngine: NSObject, AVSpeechSynthesizerDelegate {
         } else {
             complete()
         }
-    }
-
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                           didFail utterance: AVSpeechUtterance,
-                           error: AVSpeechSynthesisError) {
-        guard generation == playbackTokens.current else { return }
-        let requestTag = tag
-        tag = ""
-        owner?.notice("朗读失败，请检查手机英文语音设置")
-        owner?.speechDone(tag: requestTag, error: "朗读失败，请检查英文语音设置")
     }
 
     private func complete() {

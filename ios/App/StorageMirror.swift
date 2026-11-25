@@ -87,10 +87,7 @@ final class StorageMirror {
         let tmp = directory.appendingPathComponent("storage-mirror.tmp")
         do {
             try data.write(to: tmp, options: .atomic)
-            _ = try? FileManager.default.replaceItem(at: mirrorURL,
-                                                     withItemAt: tmp,
-                                                     backupFileName: nil,
-                                                     creatingDirectoryForDestination: true)
+            _ = try FileManager.default.replaceItemAt(mirrorURL, withItemAt: tmp)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
         }

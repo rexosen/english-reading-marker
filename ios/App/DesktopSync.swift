@@ -164,7 +164,7 @@ final class DesktopSync {
             switch ns.code {
             case NSURLErrorTimedOut: return "连接电脑超时，请确认桌面版已开启同步服务"
             case NSURLErrorNotConnectedToInternet: return "手机未联网，请检查 Wi-Fi 或蜂窝网络"
-            case NSURLErrorNetworkResourceLost: return "网络中断，请重试"
+            case NSURLErrorNetworkConnectionLost: return "网络中断，请重试"
             case NSURLErrorCannotConnectToHost: return "无法连接电脑，请确认在同一 Wi-Fi 且已开启同步"
             case NSURLErrorCancelled: return "操作已取消"
             default: break

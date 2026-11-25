@@ -46,9 +46,9 @@ final class WebServer {
                 self.receive(connection, buffer: Data())
             }
         }
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self, case .ready(let endpoint) = state,
-                  case .hostPort(_, let port) = endpoint else { return }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, case .ready = state,
+                  let port = listener?.port else { return }
             self.baseURL = URL(string: "http://127.0.0.1:\(port.rawValue)/")
             completion(self.baseURL)
         }
@@ -93,7 +93,7 @@ final class WebServer {
                         headers: ["Content-Type": "text/plain; charset=utf-8"],
                         body: Data("not found".utf8))
         }
-        let attributes = try? file.attributesOfItem(atPath: file.path)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
         let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
         var headers = ["Content-Type": mime(file.pathExtension),
                        "Accept-Ranges": "bytes",
