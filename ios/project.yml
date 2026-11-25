@@ -12,7 +12,6 @@ options:
   deploymentTarget:
     iOS: "16.0"          # 安卓 minSdk 26(Android 8)；iOS 16 是能同时用上
                          # PHPicker + isInspectable + NWListener 的最低稳定版本
-  createIntermediateGroups: true
   developmentLanguage: zh-Hans
 
 settings:
@@ -37,14 +36,8 @@ targets:
       - path: Resources
       # 页面与词库：与安卓共用同一份源文件，由 Tools/sync_web_assets.py 生成
       - path: WebResources
+        type: folder
         buildPhase: resources
-        group: WebResources
-      # sqlite3.h + module.modulemap 只要参与头搜索路径，不要进 Sources 编译
-      - path: CHeaders
-        buildPhase: none
-        includes:
-          - "module.modulemap"
-          - "sqlite3.h"
     settings:
       base:
         PRODUCT_NAME: EnglishReadingMarker

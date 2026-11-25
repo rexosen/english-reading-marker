@@ -23,6 +23,7 @@ permissions:
 jobs:
   build-ipa:
     runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,16 +36,31 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/ecdict
           if curl -fSL --retry 3 -o /tmp/ecdict/ecdict.zip \
-            "https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-csv-28.zip"; then
+            "https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-sqlite-28.zip"; then
             unzip -o -q /tmp/ecdict/ecdict.zip -d /tmp/ecdict
-            CSV=$(find /tmp/ecdict -name "*.csv" | head -n 1)
+            DB=$(find /tmp/ecdict -name "*.db" | head -n 1)
+            python3 - "$DB" android/app/src/main/assets/dictionary.sqlite3 << 'PYEOF'
+          import sqlite3, sys
+          src_path, dst_path = sys.argv[1], sys.argv[2]
+          src = sqlite3.connect(src_path)
+          dst = sqlite3.connect(dst_path)
+          dst.execute("CREATE TABLE words(word TEXT PRIMARY KEY, meaning TEXT NOT NULL)")
+          rows = []
+          for word, trans in src.execute("SELECT word, translation FROM stardict WHERE translation IS NOT NULL AND translation != ''"):
+              w = (word or "").strip().casefold()
+              m = (trans or "").replace("\\n", "\n").strip()
+              if w and m:
+                  rows.append((w, m))
+          dst.executemany("INSERT OR REPLACE INTO words VALUES(?,?)", rows)
+          dst.commit()
+          print(f"Converted {dst.execute('SELECT COUNT(*) FROM words').fetchone()[0]} ECDICT entries")
+          PYEOF
           else
             echo "Fallback to ecdict.mini.csv"
             curl -fSL --retry 3 -o /tmp/ecdict/ecdict.mini.csv \
               "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.mini.csv"
-            CSV="/tmp/ecdict/ecdict.mini.csv"
+            python3 tools/build_dictionary.py /tmp/ecdict/ecdict.mini.csv android/app/src/main/assets/dictionary.sqlite3
           fi
-          python3 tools/build_dictionary.py "$CSV" android/app/src/main/assets/dictionary.sqlite3
           ls -lh android/app/src/main/assets/dictionary.sqlite3
 
       - name: Sync Web assets and prepare SQLite header
@@ -56,7 +72,7 @@ jobs:
 
       - name: Generate Xcode project
         working-directory: ios
-        run: xcodegen generate --spec project.yml
+        run: xcodegen generate --spec project.yml --no-cache --verbose
 
       - name: Build unsigned iOS app
         working-directory: ios
