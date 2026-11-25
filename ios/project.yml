@@ -59,6 +59,7 @@ targets:
         HEADER_SEARCH_PATHS: $(SRCROOT)/CHeaders
         # 对应安卓「本地 SQLite」：iOS 不需要打包 sqlcipher，用系统 libsqlite3 就够
         OTHER_LDFLAGS: $(inherited) -lsqlite3
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOL_EXTENSIONS: "YES"
         ENABLE_BITCODE: "NO"                   # Xcode 14+ 已不支持 bitcode
         VALID_ARCHS: arm64
