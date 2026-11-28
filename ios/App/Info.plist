@@ -52,29 +52,6 @@
 	</array>
 
 	<!--
-	  没有这段 scene manifest，UIKit 会退回旧式单窗口模式，
-	  AppDelegate.configurationForConnecting 就不会被调用（表现为启动后黑屏）。
-	  对应安卓 setContentView(WebView) 那种「一个 Activity 一个窗口」的结构。
-	-->
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<false/>
-		<key>UISceneConfigurations</key>
-		<dict>
-			<key>UIWindowSceneSessionRoleApplication</key>
-			<array>
-				<dict>
-					<key>UISceneConfigurationName</key>
-					<string>Default</string>
-					<key>UISceneDelegateClassName</key>
-					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
-				</dict>
-			</array>
-		</dict>
-	</dict>
-
-	<!--
 	  对应安卓 AndroidManifest 里的 android:usesCleartextTraffic="true"。
 	  iOS 的等价物是 ATS：桌面同步服务是 http://192.168.x.x:18765 明文，
 	  不加这条例外，所有 /pair /sync /translate /tts 请求会被系统直接拦成
