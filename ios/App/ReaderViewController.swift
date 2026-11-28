@@ -92,15 +92,13 @@ final class ReaderViewController: UIViewController {
         self.server = server
         server.start { [weak self] baseURL in
             guard let self else { return }
-            let url: URL
-            if let baseURL {
-                url = baseURL
-            } else {
-                // 回退：直接 file:// 加载（子资源可能被拦，功能仍大部分可用）
-                url = index
-            }
             DispatchQueue.main.async {
-                self.webView.load(URLRequest(url: url))
+                if let baseURL {
+                    self.webView.load(URLRequest(url: baseURL))
+                } else {
+                    // 回退：使用 loadFileURL 并授权整个 WebResources 目录，确保同目录 JS/CSS 可正常加载
+                    self.webView.loadFileURL(index, allowingReadAccessTo: Self.webDirectory)
+                }
             }
         }
     }

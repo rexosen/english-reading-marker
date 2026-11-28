@@ -28,10 +28,16 @@ final class WebServer {
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
         params.allowLocalEndpointReuse = true
-        guard let listener = try? NWListener(using: params, on: .any) else {
+        guard let listener = try? NWListener(using: params) else {
             completion(nil); return
         }
         self.listener = listener
+        var finished = false
+        let finish: (URL?) -> Void = { url in
+            if finished { return }
+            finished = true
+            completion(url)
+        }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             self.queue.async {
@@ -47,12 +53,28 @@ final class WebServer {
             }
         }
         listener.stateUpdateHandler = { [weak self, weak listener] state in
-            guard let self, case .ready = state,
-                  let port = listener?.port else { return }
-            self.baseURL = URL(string: "http://127.0.0.1:\(port.rawValue)/")
-            completion(self.baseURL)
+            guard let self else { return }
+            switch state {
+            case .ready:
+                if let port = listener?.port {
+                    self.baseURL = URL(string: "http://127.0.0.1:\(port.rawValue)/")
+                    finish(self.baseURL)
+                } else {
+                    finish(nil)
+                }
+            case .failed, .cancelled:
+                self.stop()
+                finish(nil)
+            default:
+                break
+            }
         }
         listener.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, !finished else { return }
+            self.stop()
+            finish(nil)
+        }
     }
 
     func stop() {
