@@ -40,11 +40,11 @@ def _review_schedule(value):
 
 
 def set_study(db, key, value, *, expected=_UNSPECIFIED):
-    if not isinstance(key, str) or len(key) > 220 or not re.fullmatch(r'(group|meta|note|review|vgroup|vcat):[A-Za-z0-9:_~.%-]+', key):
+    if not isinstance(key, str) or len(key) > 220 or not re.fullmatch(r'(group|meta|note|review|vgroup|vcat|listen):[A-Za-z0-9:_~.%-]+', key):
         raise ValueError('学习记录编号无效')
     prefix = key.split(':', 1)[0]
     if value is None:
-        if prefix not in ('note', 'group', 'vgroup', 'vcat'):
+        if prefix not in ('note', 'group', 'vgroup', 'vcat', 'listen'):
             raise ValueError('此类学习记录不能删除')
     else:
         if not isinstance(value, dict) or len(json.dumps(value, ensure_ascii=False)) > 40000:
@@ -68,6 +68,25 @@ def set_study(db, key, value, *, expected=_UNSPECIFIED):
                 if group not in stored:
                     raise ValueError('生词分类不存在，请重新选择')
             value = {'word': word, 'group': group}
+        elif prefix == 'listen':
+            article_id = key.split(':', 1)[1]
+            row = db.execute('SELECT 1 FROM sync_articles WHERE sync_id=?', (article_id,)).fetchone()
+            if row is None:
+                raise ValueError('听力标记对应文章不存在')
+            cleaned = {}
+            for span_key, item in value.items():
+                if not isinstance(item, dict) or item.get('status') not in ('heard', 'missed'):
+                    continue
+                if type(item.get('start')) is not int or type(item.get('end')) is not int:
+                    continue
+                cleaned[str(span_key)] = {
+                    'start': item['start'],
+                    'end': item['end'],
+                    'text': str(item.get('text', ''))[:4000],
+                    'status': item['status'],
+                    'updated': str(item.get('updated', '')),
+                }
+            value = cleaned
         elif prefix == 'review' and key.startswith('review:manual:'):
             # Review record of a hand-written word or phrase: keyed by vocabulary id.
             try:
@@ -185,9 +204,14 @@ class StudyRepository:
         return [{'key': key, '_base': value, **value, 'local_id': by_sync[value['article_id']]['id'], 'title': by_sync[value['article_id']]['title']}
                 for key, value in self.items().items() if key.startswith('note:') and value and value['article_id'] in by_sync]
 
-    def review_cards(self, *, all_cards=False):
+    def review_cards(self, *, all_cards=False, category=None, article_info=None):
         items, now, cards = self.items(), datetime.now(timezone.utc), []
-        for word in self.repository.list_vocabulary():
+        vocab_list = self.repository.list_vocabulary()
+        if category not in (None, 'all'):
+            from src.vocabulary import VocabularyCategories
+            annotated = VocabularyCategories(self).annotate(vocab_list, article_info or {})
+            vocab_list = [w for w in annotated if w['category'] == category]
+        for word in vocab_list:
             if word['article_id'] is None:
                 # Hand-written entry: reviewed under its own vocabulary id.
                 key = f"review:manual:{word['id']}"
@@ -208,3 +232,49 @@ class StudyRepository:
             self.set(card['key'], {'manual': True, 'vocabulary_id': card['id'], **schedule})
             return
         self.set(card['key'], {'article_id': card['sync_id'], 'start': card['start'], 'end': card['end'], **schedule})
+
+    def stats(self, *, article_info=None, listening=None) -> dict:
+        articles = self.repository.list_articles()
+        items = self.items()
+        sync_ids = dict(self.db.execute('SELECT article_id, sync_id FROM sync_articles'))
+        read_articles = sum(
+            1 for a in articles if (items.get('meta:' + sync_ids.get(a['id'], '')) or {}).get('read')
+        )
+        total_words = sum(len(re.findall(r"[A-Za-z0-9'-]+", a['text'])) for a in articles)
+        total_annotations = self.db.execute('SELECT COUNT(*) FROM annotations').fetchone()[0]
+        vocab = self.repository.list_vocabulary()
+        now = datetime.now(timezone.utc)
+        due_vocab = 0
+        mastered_vocab = 0
+        total_reviews = 0
+        for w in vocab:
+            key = f"review:manual:{w['id']}" if w['article_id'] is None else f"review:{sync_ids.get(w['article_id'], '')}:{w['start']}:{w['end']}"
+            rec = items.get(key)
+            if not rec or datetime.fromisoformat(rec['due']) <= now:
+                due_vocab += 1
+            if rec:
+                total_reviews += int(rec.get('count', 0))
+                if float(rec.get('interval', 0)) >= 7:
+                    mastered_vocab += 1
+        from src.vocabulary import VocabularyCategories
+        cats = VocabularyCategories(self)
+        annotated = cats.annotate(vocab, article_info or {})
+        cat_counts: dict[str, int] = {}
+        for rec in annotated:
+            label = rec['category_name'] or '未分类'
+            cat_counts[label] = cat_counts.get(label, 0) + 1
+        dictation = listening.dictation_summary() if listening and hasattr(listening, 'dictation_summary') else {'sessions': 0, 'avg_accuracy': 0.0}
+        return {
+            'total_articles': len(articles),
+            'read_articles': read_articles,
+            'total_words': total_words,
+            'total_annotations': total_annotations,
+            'total_notes': len(self.notes()),
+            'total_vocab': len(vocab),
+            'due_vocab': due_vocab,
+            'mastered_vocab': mastered_vocab,
+            'total_reviews': total_reviews,
+            'category_counts': sorted(cat_counts.items(), key=lambda kv: -kv[1]),
+            'dictation_sessions': dictation['sessions'],
+            'dictation_avg_accuracy': dictation['avg_accuracy'],
+        }

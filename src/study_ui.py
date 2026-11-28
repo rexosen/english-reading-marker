@@ -2,37 +2,60 @@
 from __future__ import annotations
 import hashlib
 import html
-import json
+import re
 import uuid
 from pathlib import Path
-from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QSettings, QUrl
-from PySide6.QtGui import QColor, QFont, QTextCursor, QTextBlockFormat, QImage, QPainter
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QListWidget, QListWidgetItem, QTextEdit, QTextBrowser, QComboBox, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QFileDialog, QMessageBox, QInputDialog, QColorDialog, QWidget)
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QShortcut, QTextBlockFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QTextBrowser,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 from PySide6.QtTextToSpeech import QTextToSpeech
 from src.domain import python_offset_to_qt, qt_offset_to_python
 from src.dictation import compare
+from src.dictionary import cached_translation, format_translation_html, lookup_chinese, lookup_local_entry
 from src.listening import ListeningReviews
 from src.study import StudyRepository, sentence_ranges
 from src.storage import backup_database, backup_details, schedule_restore, audio_cache_stats, clear_audio_cache
+from src.theme import get_theme, is_dark_theme
 
 
 class StudyUi:
     def init_study_ui(self):
         self.study = StudyRepository(self.repository)
-        self.listening = ListeningReviews(self.repository.database_path.parent / 'listening_reviews.json')
+        self.listening = ListeningReviews(self.repository.database_path.parent / 'listening_reviews.json', study=self.study)
         self.display_settings = QSettings(str(self.repository.database_path.parent / 'display.ini'), QSettings.Format.IniFormat)
-        defaults = {'size':18, 'line':160, 'margin':22, 'theme':'paper', 'image':'', 'opacity':22, 'width':1200}
-        self.display_options = {key:self.display_settings.value(key, value) for key,value in defaults.items()}
-        for key in ('size','line','margin','opacity','width'): self.display_options[key] = int(self.display_options[key])
+        defaults = {'size': 18, 'line': 160, 'margin': 22, 'theme': 'paper', 'image': '', 'opacity': 22, 'width': 1200}
+        self.display_options = {key: self.display_settings.value(key, value) for key, value in defaults.items()}
+        for key in ('size', 'line', 'margin', 'opacity', 'width'):
+            self.display_options[key] = int(self.display_options[key])
         self._sentence_active = False
         self._sentence_spoken = False
         self._sentence_index = 0
         self._sentence_round = 0
         self._sentences = []
         self._gap_paused = False
+        self._active_sentence_span = None
         self.sentence_timer = QTimer(self)
         self.sentence_timer.setSingleShot(True)
         self.sentence_timer.timeout.connect(self._play_sentence)
@@ -45,14 +68,18 @@ class StudyUi:
         menu.addAction('生词复习卡片', self.open_review)
         menu.addAction('句子收藏与笔记', self.open_notes)
         menu.addAction('听写练习（当前文章）', self.open_dictation)
+        menu.addAction('学习统计', self.open_stats)
+        menu.addSeparator()
         menu.addAction('阅读显示与背景图', self.open_display)
         menu.addAction('管理文章分组', self.manage_groups)
         self.reader.sentence_requested.connect(self.play_sentence_at)
+        if hasattr(self.reader, 'listening_mark_requested'):
+            self.reader.listening_mark_requested.connect(self._mark_sentence)
         self.refresh_group_filter()
 
     def add_library_controls(self, layout):
         self.article_search = QLineEdit()
-        self.article_search.setPlaceholderText('搜索标题或正文')
+        self.article_search.setPlaceholderText('搜索标题或正文…')
         self.article_search.textChanged.connect(lambda: self.refresh_articles(self.current_article_id))
         layout.addWidget(self.article_search)
         row = QHBoxLayout()
@@ -73,28 +100,49 @@ class StudyUi:
         layout.addWidget(self.sentence_controls)
         self.sentence_controls.hide()
         row = QHBoxLayout()
-        for title, callback in [('上一句', lambda:self.step_sentence(-1)), ('▶ 逐句', self.start_sentences), ('下一句', lambda:self.step_sentence(1))]:
-            button = QPushButton(title); button.clicked.connect(callback); row.addWidget(button)
+        for title, callback in [('上一句', lambda: self.step_sentence(-1)), ('▶ 逐句', self.start_sentences), ('下一句', lambda: self.step_sentence(1))]:
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            row.addWidget(button)
         self.single_sentence = QCheckBox('只循环当前句')
         row.addWidget(self.single_sentence)
-        self.sentence_repeat = QSpinBox(); self.sentence_repeat.setRange(1,99); self.sentence_repeat.setValue(1); self.sentence_repeat.setSuffix(' 遍')
+        self.sentence_repeat = QSpinBox()
+        self.sentence_repeat.setRange(1, 99)
+        self.sentence_repeat.setValue(1)
+        self.sentence_repeat.setSuffix(' 遍')
         row.addWidget(self.sentence_repeat)
-        self.sentence_gap = QDoubleSpinBox(); self.sentence_gap.setRange(0,30); self.sentence_gap.setSingleStep(0.5); self.sentence_gap.setValue(1); self.sentence_gap.setSuffix(' 秒停顿')
+        self.sentence_gap = QDoubleSpinBox()
+        self.sentence_gap.setRange(0, 30)
+        self.sentence_gap.setSingleStep(0.5)
+        self.sentence_gap.setValue(1)
+        self.sentence_gap.setSuffix(' 秒停顿')
         row.addWidget(self.sentence_gap)
         controls_layout.addLayout(row)
         row2 = QHBoxLayout()
-        for title, callback in [('✓ 听懂', lambda: self._mark_sentence('heard')), ('✗ 没听懂', lambda: self._mark_sentence('missed'))]:
-            button = QPushButton(title); button.clicked.connect(callback); row2.addWidget(button)
-        self.replay_missed = QCheckBox('只重听没听懂句'); self.replay_missed.toggled.connect(self._refresh_listening_label); row2.addWidget(self.replay_missed)
-        self.listening_label = QLabel(''); row2.addWidget(self.listening_label); row2.addStretch(1)
+        for title, callback in [('✓ 听懂 (Y)', lambda: self._mark_sentence('heard')), ('✗ 没听懂 (N)', lambda: self._mark_sentence('missed'))]:
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            row2.addWidget(button)
+        self.replay_missed = QCheckBox('只重听没听懂句')
+        self.replay_missed.toggled.connect(self._refresh_listening_label)
+        row2.addWidget(self.replay_missed)
+        self.listening_label = QLabel('')
+        self.listening_label.setObjectName('muted')
+        row2.addWidget(self.listening_label)
+        row2.addStretch(1)
         controls_layout.addLayout(row2)
-        self.sentence_label = QLabel('双击正文也可从所在句开始逐句朗读；逐句时可用“听懂/没听懂”标记当前句。快捷键（焦点在正文时）：空格＝暂停/继续，↑＝上一句，↓＝下一句，←／→＝重复当前句，1＝1 倍速，2＝0.75 倍速。')
+        self.sentence_label = QLabel(
+            '双击正文可从所在句开始逐句朗读；没听懂的句子会以淡红底色标出。'
+            '快捷键（焦点在正文）：空格＝暂停/继续，↑↓＝上下句，←→＝重复当前句，1/2＝1/0.75 倍速，Y＝听懂，N＝没听懂。'
+        )
+        self.sentence_label.setObjectName('muted')
         self.sentence_label.setWordWrap(True)
         controls_layout.addWidget(self.sentence_label)
 
     def filtered_articles(self):
         articles = self.repository.list_articles()
-        if not hasattr(self,'study'): return articles
+        if not hasattr(self, 'study'):
+            return articles
         query = self.article_search.text().strip().casefold()
         selected_group = self.group_filter.currentData()
         result = []
@@ -102,200 +150,531 @@ class StudyUi:
         active_groups = self.study.groups()
         sync_ids = dict(self.repository.connection.execute('SELECT article_id,sync_id FROM sync_articles'))
         for a in articles:
-            meta = items.get('meta:' + sync_ids[a['id']]) or {'article_id':sync_ids[a['id']], 'group':'', 'pinned':False, 'read':False}
-            if query and query not in (a['title']+'\n'+a['text']).casefold(): continue
+            meta = items.get('meta:' + sync_ids[a['id']]) or {'article_id': sync_ids[a['id']], 'group': '', 'pinned': False, 'read': False}
+            if query and query not in (a['title'] + '\n' + a['text']).casefold():
+                continue
             group = meta['group'] if meta['group'] in active_groups else ''
-            if selected_group == 'ungrouped' and group: continue
-            if selected_group not in ('all','ungrouped',None) and group != selected_group: continue
-            result.append({**a,'meta':meta})
-        return sorted(result,key=lambda a:(not a['meta']['pinned'],-a['id']))
+            if selected_group == 'ungrouped' and group:
+                continue
+            if selected_group not in ('all', 'ungrouped', None) and group != selected_group:
+                continue
+            result.append({**a, 'meta': meta, 'group_name': active_groups.get(group, '')})
+        return sorted(result, key=lambda a: (not a['meta']['pinned'], -a['id']))
 
     def article_caption(self, article):
-        meta = article.get('meta',{})
+        meta = article.get('meta', {})
         return ('★ ' if meta.get('pinned') else '') + article['title'] + ('  ✓' if meta.get('read') else '')
 
     def refresh_group_filter(self):
-        if not hasattr(self,'study'): return
+        if not hasattr(self, 'study'):
+            return
         selected = self.group_filter.currentData()
         self.group_filter.blockSignals(True)
-        self.group_filter.clear(); self.group_filter.addItem('全部文章','all'); self.group_filter.addItem('未分组','ungrouped')
-        for key,name in self.study.groups().items(): self.group_filter.addItem(name,key)
-        self.group_filter.setCurrentIndex(max(0,self.group_filter.findData(selected)))
+        self.group_filter.clear()
+        self.group_filter.addItem('全部文章', 'all')
+        self.group_filter.addItem('未分组', 'ungrouped')
+        for key, name in self.study.groups().items():
+            self.group_filter.addItem(name, key)
+        self.group_filter.setCurrentIndex(max(0, self.group_filter.findData(selected)))
         self.group_filter.blockSignals(False)
 
     def manage_groups(self):
-        if not hasattr(self,'study'): return
-        dialog = QDialog(self); dialog.setWindowTitle('管理文章分组'); dialog.resize(440,360)
-        layout = QVBoxLayout(dialog); listing = QListWidget(); layout.addWidget(listing)
+        if not hasattr(self, 'study'):
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('管理文章分组')
+        dialog.resize(440, 360)
+        layout = QVBoxLayout(dialog)
+        listing = QListWidget()
+        layout.addWidget(listing)
+
         def refresh():
-            listing.clear(); self.refresh_group_filter(); self.refresh_articles(self.current_article_id)
-            for key,name in self.study.groups().items():
-                item=QListWidgetItem(name);item.setData(Qt.ItemDataRole.UserRole,key);listing.addItem(item)
+            listing.clear()
+            self.refresh_group_filter()
+            self.refresh_articles(self.current_article_id)
+            for key, name in self.study.groups().items():
+                item = QListWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                listing.addItem(item)
+
         def edit(create=False):
-            item=listing.currentItem()
-            if not create and not item:return
-            name,ok=QInputDialog.getText(dialog,'新建分组' if create else '分组改名','分组名称（最多60字）：',text='' if create else item.text())
-            if not ok:return
-            try:self.study.set('group:'+str(uuid.uuid4()) if create else item.data(Qt.ItemDataRole.UserRole),{'name':name});refresh()
-            except ValueError as error:QMessageBox.warning(dialog,'保存失败',str(error))
+            item = listing.currentItem()
+            if not create and not item:
+                return
+            name, ok = QInputDialog.getText(dialog, '新建分组' if create else '分组改名', '分组名称（最多60字）：', text='' if create else item.text())
+            if not ok:
+                return
+            try:
+                self.study.set('group:' + str(uuid.uuid4()) if create else item.data(Qt.ItemDataRole.UserRole), {'name': name})
+                refresh()
+            except ValueError as error:
+                QMessageBox.warning(dialog, '保存失败', str(error))
+
         def remove():
-            item=listing.currentItem()
-            if not item:return
-            if QMessageBox.question(dialog,'删除分组','仅删除分组，组内文章会显示为未分组。继续？') != QMessageBox.StandardButton.Yes:return
-            self.study.set(item.data(Qt.ItemDataRole.UserRole),None);refresh()
-        row=QHBoxLayout()
-        for title,action in [('新建',lambda:edit(True)),('改名',lambda:edit(False)),('删除',remove)]:
-            button=QPushButton(title);button.clicked.connect(action);row.addWidget(button)
-        layout.addLayout(row);refresh();dialog.exec()
+            item = listing.currentItem()
+            if not item:
+                return
+            if QMessageBox.question(dialog, '删除分组', '仅删除分组，组内文章会显示为未分组。继续？') != QMessageBox.StandardButton.Yes:
+                return
+            self.study.set(item.data(Qt.ItemDataRole.UserRole), None)
+            refresh()
+
+        row = QHBoxLayout()
+        for title, action in [('新建', lambda: edit(True)), ('改名', lambda: edit(False)), ('删除', remove)]:
+            button = QPushButton(title)
+            button.clicked.connect(action)
+            row.addWidget(button)
+        layout.addLayout(row)
+        refresh()
+        dialog.exec()
 
     def assign_group(self, article_id):
-        groups=self.study.groups(); names=['未分组']+list(groups.values())
-        meta=self.study.metadata(article_id); keys=['']+list(groups)
-        name,ok=QInputDialog.getItem(self,'移动到分组','选择分组：',names,keys.index(meta['group']) if meta['group'] in keys else 0,False)
-        if ok:self.study.update_metadata(article_id,group=keys[names.index(name)]);self.refresh_articles(self.current_article_id)
+        groups = self.study.groups()
+        names = ['未分组'] + list(groups.values())
+        meta = self.study.metadata(article_id)
+        keys = [''] + list(groups)
+        name, ok = QInputDialog.getItem(self, '移动到分组', '选择分组：', names, keys.index(meta['group']) if meta['group'] in keys else 0, False)
+        if ok:
+            self.study.update_metadata(article_id, group=keys[names.index(name)])
+            self.refresh_articles(self.current_article_id)
 
     def toggle_article_flag(self, article_id, field):
-        self.study.update_metadata(article_id,**{field:not self.study.metadata(article_id)[field]})
+        self.study.update_metadata(article_id, **{field: not self.study.metadata(article_id)[field]})
         self.refresh_articles(self.current_article_id)
 
     def jump_to_range(self, article_id, start, end):
-        self.article_search.clear();self.group_filter.setCurrentIndex(0);self.refresh_articles(article_id)
-        if self.current_article_id != article_id:return
-        text=self.reader.toPlainText();cursor=self.reader.textCursor()
-        cursor.setPosition(python_offset_to_qt(text,start));cursor.setPosition(python_offset_to_qt(text,end),QTextCursor.MoveMode.KeepAnchor)
-        self.reader.setTextCursor(cursor);self.reader.ensureCursorVisible()
+        self.article_search.clear()
+        self.group_filter.setCurrentIndex(0)
+        self.refresh_articles(article_id)
+        if self.current_article_id != article_id:
+            return
+        text = self.reader.toPlainText()
+        cursor = self.reader.textCursor()
+        cursor.setPosition(python_offset_to_qt(text, start))
+        cursor.setPosition(python_offset_to_qt(text, end), QTextCursor.MoveMode.KeepAnchor)
+        self.reader.setTextCursor(cursor)
+        self.reader.ensureCursorVisible()
+
+    def _format_review_context(self, word: str, context: str, *, reveal: bool, definition: str = '') -> str:
+        dark = is_dark_theme(self.display_options.get('theme', 'paper'))
+        t = get_theme(self.display_options.get('theme', 'paper'))
+        ctx = context or '（无例句）'
+        escaped_ctx = html.escape(ctx)
+        if word:
+            pattern = re.compile(re.escape(html.escape(word)), re.IGNORECASE)
+            if reveal:
+                escaped_ctx = pattern.sub(
+                    lambda m: f'<span style="background:{t["accent_soft"]};color:{t["accent"]};font-weight:700;padding:1px 4px;border-radius:4px;">{m.group(0)}</span>',
+                    escaped_ctx,
+                )
+            else:
+                blank = '_' * max(5, min(14, len(word)))
+                escaped_ctx = pattern.sub(
+                    f'<span style="color:{t["accent"]};font-weight:700;letter-spacing:1px;">{blank}</span>',
+                    escaped_ctx,
+                )
+        body = f'<div style="font-size:11.5pt;line-height:1.7;color:{t["text"]};">{escaped_ctx}</div>'
+        if reveal:
+            entry = lookup_local_entry(word)
+            formatted_def = format_translation_html(word, definition or '暂无释义', entry=entry, dark=dark)
+            body += (
+                f'<hr style="border:0;border-top:1px solid {t["panel_border"]};margin:14px 0;">'
+                f'<div style="font-weight:700;color:{t["muted"]};margin-bottom:6px;">中文释义</div>'
+                f'{formatted_def}'
+            )
+        return body
 
     def open_review(self):
-        dialog=QDialog(self);dialog.setWindowTitle('生词复习卡片');dialog.resize(720,560)
-        layout=QVBoxLayout(dialog);mode=QComboBox();mode.addItem('到期与未复习的生词',False);mode.addItem('全部生词练习',True);layout.addWidget(mode)
-        status=QLabel();layout.addWidget(status)
-        word=QLabel();word.setWordWrap(True);word.setStyleSheet('font-size:28pt;font-weight:bold;');layout.addWidget(word)
-        source=QLabel();source.setWordWrap(True);layout.addWidget(source)
-        content=QTextBrowser();layout.addWidget(content,1)
-        row=QHBoxLayout();pronounce=QPushButton('▶ 单词发音');reveal=QPushButton('显示释义');jump=QPushButton('回到原文')
-        for button in (pronounce,reveal,jump):row.addWidget(button)
-        layout.addLayout(row);rating=QHBoxLayout();buttons=[];session={'queue':[],'card':None,'done':0}
+        dialog = QDialog(self)
+        dialog.setWindowTitle('生词复习卡片')
+        dialog.resize(740, 590)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        mode = QComboBox()
+        mode.addItem('到期与未复习的生词', False)
+        mode.addItem('全部生词练习', True)
+        top.addWidget(mode, 1)
+
+        cat_box = QComboBox()
+        cat_box.addItem('全部分类', 'all')
+        categories = self._vocabulary_categories()
+        for key, name in categories.all().items():
+            cat_box.addItem(name, key)
+        cat_box.addItem('未分类', '')
+        top.addWidget(cat_box, 1)
+        layout.addLayout(top)
+
+        progress = QProgressBar()
+        progress.setTextVisible(False)
+        layout.addWidget(progress)
+
+        status = QLabel()
+        status.setObjectName('muted')
+        layout.addWidget(status)
+
+        card_frame = QFrame()
+        card_frame.setObjectName('panel')
+        card_layout = QVBoxLayout(card_frame)
+        card_layout.setContentsMargins(20, 18, 20, 18)
+        word = QLabel()
+        word.setWordWrap(True)
+        word.setStyleSheet('font-size:26pt;font-weight:700;')
+        card_layout.addWidget(word)
+        source = QLabel()
+        source.setObjectName('muted')
+        source.setWordWrap(True)
+        card_layout.addWidget(source)
+        content = QTextBrowser()
+        content.setStyleSheet('border: 0; background: transparent; padding: 6px 0;')
+        card_layout.addWidget(content, 1)
+        layout.addWidget(card_frame, 1)
+
+        row = QHBoxLayout()
+        pronounce = QPushButton('▶ 发音 (R)')
+        reveal = QPushButton('显示释义 (Space)')
+        reveal.setObjectName('primaryButton')
+        jump = QPushButton('回到原文')
+        for button in (pronounce, reveal, jump):
+            row.addWidget(button)
+        layout.addLayout(row)
+
+        rating = QHBoxLayout()
+        buttons = []
+        session = {'queue': [], 'card': None, 'done': 0, 'total': 0, 'revealed': False}
+
         def load():
-            queue=session['queue'];card=queue.pop(0) if queue else None;session['card']=card
-            for button in buttons:button.setEnabled(False)
-            pronounce.setEnabled(bool(card));reveal.setEnabled(bool(card));jump.setEnabled(bool(card) and card['article_id'] is not None)
+            queue = session['queue']
+            card = queue.pop(0) if queue else None
+            session['card'] = card
+            session['revealed'] = False
+            for button in buttons:
+                button.setEnabled(False)
+            pronounce.setEnabled(bool(card))
+            reveal.setEnabled(bool(card))
+            jump.setEnabled(bool(card) and card['article_id'] is not None)
+            total = max(1, session['total'])
+            progress.setRange(0, total)
+            progress.setValue(min(session['done'], total))
             if not card:
-                word.setText('本轮复习完成');source.setText('未到期的生词会在到期后出现，也可以切换到全部生词练习。');content.clear();status.setText(f"本轮已复习 {session['done']} 条");return
-            word.setText(card['word']);source.setText('来源：'+(card['article_title'] or '自建词条'));content.setPlainText(card['context'])
-            status.setText(f"剩余 {len(queue)+1} 条 · 本轮已复习 {session['done']} 条")
+                word.setText('本轮复习完成')
+                source.setText('未到期的生词会在到期后出现，也可以切换分类或改为全部生词练习。')
+                content.clear()
+                status.setText(f"本轮已复习 {session['done']} 条")
+                return
+            word.setText(card['word'])
+            source.setText('来源：' + (card['article_title'] or '自建词条'))
+            content.setHtml(self._format_review_context(card['word'], card['context'], reveal=False))
+            status.setText(f"剩余 {len(queue) + 1} 条 · 本轮已复习 {session['done']} 条")
+
         def reset():
-            session.update(queue=self.study.review_cards(all_cards=mode.currentData()),done=0);load()
+            cards = self.study.review_cards(
+                all_cards=mode.currentData(),
+                category=cat_box.currentData(),
+                article_info=self._vocabulary_article_info(),
+            )
+            session.update(queue=cards, done=0, total=len(cards))
+            load()
+
         def show_answer():
-            card=session['card']
-            if card:content.setPlainText(card['context']+'\n\n中文释义：\n'+card['definition']);[b.setEnabled(True) for b in buttons]
+            card = session['card']
+            if card and not session['revealed']:
+                session['revealed'] = True
+                content.setHtml(self._format_review_context(card['word'], card['context'], reveal=True, definition=card['definition']))
+                for b in buttons:
+                    b.setEnabled(True)
+
         def grade(value):
-            card=session['card']
-            if not card:return
-            self.study.grade(card,value);session['done']+=1;load()
-        for title,value in [('不认识 · 10分钟后','again'),('模糊 · 1天后','hard'),('认识 · 延长间隔','known')]:
-            button=QPushButton(title);button.clicked.connect(lambda checked=False,v=value:grade(v));rating.addWidget(button);buttons.append(button)
-        layout.addLayout(rating);layout.addWidget(QLabel('认识：首次3天，再次按上次间隔翻倍，最多365天。各设备同步复习结果。'))
-        mode.currentIndexChanged.connect(reset);reveal.clicked.connect(show_answer)
-        pronounce.clicked.connect(lambda:self._speak(session['card']['word']) if session['card'] else None)
+            card = session['card']
+            if not card or not session['revealed']:
+                return
+            self.study.grade(card, value)
+            if value == 'again':
+                # Re-queue forgotten cards at the end of this round for immediate reinforcement
+                session['queue'].append(card)
+            else:
+                session['done'] += 1
+            load()
+
+        for title, value in [('1 · 不认识（本轮回炉）', 'again'), ('2 · 模糊（1天后）', 'hard'), ('3 · 认识（延长间隔）', 'known')]:
+            button = QPushButton(title)
+            button.clicked.connect(lambda checked=False, v=value: grade(v))
+            rating.addWidget(button)
+            buttons.append(button)
+        layout.addLayout(rating)
+        hint = QLabel('快捷键：Space＝显示释义 · 1＝不认识 · 2＝模糊 · 3＝认识 · R＝重播发音。认识首次3天，之后翻倍，最多365天。')
+        hint.setObjectName('muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Space), dialog, activated=show_answer)
+        QShortcut(QKeySequence(Qt.Key.Key_1), dialog, activated=lambda: grade('again'))
+        QShortcut(QKeySequence(Qt.Key.Key_2), dialog, activated=lambda: grade('hard'))
+        QShortcut(QKeySequence(Qt.Key.Key_3), dialog, activated=lambda: grade('known'))
+        QShortcut(QKeySequence(Qt.Key.Key_R), dialog, activated=lambda: self._speak(session['card']['word']) if session['card'] else None)
+
+        mode.currentIndexChanged.connect(reset)
+        cat_box.currentIndexChanged.connect(reset)
+        reveal.clicked.connect(show_answer)
+        pronounce.clicked.connect(lambda: self._speak(session['card']['word']) if session['card'] else None)
+
         def go():
-            card=session['card']
-            if card and card['article_id'] is not None:dialog.accept();self.jump_to_range(card['article_id'],card['start'],card['end'])
-        jump.clicked.connect(go);reset();dialog.exec()
+            card = session['card']
+            if card and card['article_id'] is not None:
+                dialog.accept()
+                self.jump_to_range(card['article_id'], card['start'], card['end'])
+
+        jump.clicked.connect(go)
+        reset()
+        dialog.exec()
 
     def save_selected_note(self):
-        selected=self._get_translation_selection()
-        if selected is None or self.current_article_id is None:return
-        start,end,_=selected;translation=self.current_definition if self.definition_selection==selected else ''
-        self.edit_note({'local_id':self.current_article_id,'start':start,'end':end,'text':self.reader.toPlainText()[start:end],'translation':translation,'note':''})
+        selected = self._get_translation_selection()
+        if selected is None or self.current_article_id is None:
+            return
+        start, end, _ = selected
+        translation = self.current_definition if self.definition_selection == selected else ''
+        self.edit_note({'local_id': self.current_article_id, 'start': start, 'end': end, 'text': self.reader.toPlainText()[start:end], 'translation': translation, 'note': ''})
 
-    def edit_note(self,record):
-        dialog=QDialog(self);dialog.setWindowTitle('句子收藏与笔记');dialog.resize(680,570)
-        layout=QVBoxLayout(dialog);original=QTextBrowser();original.setPlainText(record['text']);layout.addWidget(original)
-        layout.addWidget(QLabel('中文译文（可自行填写或修改）'));translation=QTextEdit();translation.setPlainText(record.get('translation',''));layout.addWidget(translation)
-        layout.addWidget(QLabel('我的笔记'));note=QTextEdit();note.setPlainText(record.get('note',''));layout.addWidget(note)
-        save=QPushButton('保存收藏');save.clicked.connect(dialog.accept);layout.addWidget(save)
-        if dialog.exec()==QDialog.DialogCode.Accepted:
-            try:self.study.save_note(record['local_id'],record['start'],record['end'],translation.toPlainText(),note.toPlainText(),record.get('key'), expected=record.get('_base'));self._show_hint('句子收藏与笔记已保存。')
-            except ValueError as error:QMessageBox.warning(self,'保存失败',str(error))
+    def edit_note(self, record):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('句子收藏与笔记')
+        dialog.resize(680, 570)
+        layout = QVBoxLayout(dialog)
+        original = QTextBrowser()
+        original.setPlainText(record['text'])
+        layout.addWidget(original)
+        layout.addWidget(QLabel('中文译文（可自行填写或修改）'))
+        translation = QTextEdit()
+        translation.setPlainText(record.get('translation', ''))
+        layout.addWidget(translation)
+        layout.addWidget(QLabel('我的笔记'))
+        note = QTextEdit()
+        note.setPlainText(record.get('note', ''))
+        layout.addWidget(note)
+        save = QPushButton('保存收藏')
+        save.setObjectName('primaryButton')
+        save.clicked.connect(dialog.accept)
+        layout.addWidget(save)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.study.save_note(record['local_id'], record['start'], record['end'], translation.toPlainText(), note.toPlainText(), record.get('key'), expected=record.get('_base'))
+                self._show_hint('句子收藏与笔记已保存。')
+            except ValueError as error:
+                QMessageBox.warning(self, '保存失败', str(error))
 
     def open_notes(self):
-        dialog=QDialog(self);dialog.setWindowTitle('句子收藏与笔记');dialog.resize(780,650)
-        layout=QVBoxLayout(dialog);search=QLineEdit();search.setPlaceholderText('搜索原文、译文、笔记或文章名称');layout.addWidget(search)
-        listing=QListWidget();listing.setWordWrap(True);layout.addWidget(listing,1);detail=QTextBrowser();layout.addWidget(detail,1)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('句子收藏与笔记')
+        dialog.resize(780, 650)
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit()
+        search.setPlaceholderText('搜索原文、译文、笔记或文章名称…')
+        layout.addWidget(search)
+        listing = QListWidget()
+        listing.setWordWrap(True)
+        layout.addWidget(listing, 1)
+        detail = QTextBrowser()
+        layout.addWidget(detail, 1)
+
         def refresh():
-            listing.clear();query=search.text().casefold()
+            listing.clear()
+            query = search.text().casefold()
             for record in self.study.notes():
-                if query and query not in (record['title']+record['text']+record['translation']+record['note']).casefold():continue
-                item=QListWidgetItem(record['title']+' · '+record['text'][:100]);item.setData(Qt.ItemDataRole.UserRole,record);listing.addItem(item)
-            if listing.count():listing.setCurrentRow(0)
-            else:detail.setPlainText('在正文中选中句段，点击“收藏所选句段”。')
-        def current():return listing.currentItem().data(Qt.ItemDataRole.UserRole) if listing.currentItem() else None
+                if query and query not in (record['title'] + record['text'] + record['translation'] + record['note']).casefold():
+                    continue
+                item = QListWidgetItem(record['title'] + ' · ' + record['text'][:100])
+                item.setData(Qt.ItemDataRole.UserRole, record)
+                listing.addItem(item)
+            if listing.count():
+                listing.setCurrentRow(0)
+            else:
+                detail.setPlainText('在正文中选中句段，点击“收藏所选句段”。')
+
+        def current():
+            return listing.currentItem().data(Qt.ItemDataRole.UserRole) if listing.currentItem() else None
+
         def show():
-            r=current()
-            if r:detail.setPlainText(r['text']+'\n\n译文：'+r['translation']+'\n\n笔记：'+r['note'])
+            r = current()
+            if r:
+                detail.setPlainText(r['text'] + '\n\n译文：' + r['translation'] + '\n\n笔记：' + r['note'])
+
         def edit():
-            if current():self.edit_note(current());refresh()
+            if current():
+                self.edit_note(current())
+                refresh()
+
         def remove():
-            r=current()
-            if r and QMessageBox.question(dialog,'删除收藏','确定删除这条句子收藏及笔记？')==QMessageBox.StandardButton.Yes:self.study.set(r['key'],None,expected=r.get('_base'));refresh()
+            r = current()
+            if r and QMessageBox.question(dialog, '删除收藏', '确定删除这条句子收藏及笔记？') == QMessageBox.StandardButton.Yes:
+                self.study.set(r['key'], None, expected=r.get('_base'))
+                refresh()
+
         def jump():
-            r=current()
-            if r:dialog.accept();self.jump_to_range(r['local_id'],r['start'],r['end'])
-        row=QHBoxLayout()
-        for title,action in [('编辑',edit),('▶ 朗读',lambda:self._speak(current()['text']) if current() else None),('回到原文',jump),('删除',remove)]:
-            button=QPushButton(title);button.clicked.connect(action);row.addWidget(button)
-        layout.addLayout(row);search.textChanged.connect(refresh);listing.currentItemChanged.connect(show);refresh();dialog.exec()
+            r = current()
+            if r:
+                dialog.accept()
+                self.jump_to_range(r['local_id'], r['start'], r['end'])
+
+        row = QHBoxLayout()
+        for title, action in [('编辑', edit), ('▶ 朗读', lambda: self._speak(current()['text']) if current() else None), ('回到原文', jump), ('删除', remove)]:
+            button = QPushButton(title)
+            button.clicked.connect(action)
+            row.addWidget(button)
+        layout.addLayout(row)
+        search.textChanged.connect(refresh)
+        listing.currentItemChanged.connect(show)
+        refresh()
+        dialog.exec()
 
     def apply_display(self):
-        options=self.display_options
-        colors={'paper':('#fff9ed','#302b25'),'light':('#ffffff','#203044'),'green':('#e5efdf','#243829'),'dark':('#202733','#dde5f0')}
-        background,foreground=colors.get(options['theme'],colors['paper'])
-        self.reader.setStyleSheet(f'QTextEdit {{background: transparent; color:{foreground}; border:1px solid #dce4ed; border-radius:12px; padding:{options["margin"]}px; font-family:Georgia,"Times New Roman"; font-size:{options["size"]}pt;}}')
+        options = self.display_options
+        theme_name = options.get('theme', 'paper')
+        t = get_theme(theme_name)
+        if hasattr(self, 'apply_global_theme'):
+            self.apply_global_theme(theme_name)
+        self.reader.setStyleSheet(
+            f'QTextEdit {{background: transparent; color:{t["reader_fg"]}; '
+            f'border:1px solid {t["reader_border"]}; border-radius:12px; '
+            f'padding:{options["margin"]}px; selection-background-color:{t["selection_bg"]}; '
+            f'font-family:Georgia,"Times New Roman"; font-size:{options["size"]}pt;}}'
+        )
         self.reader.setMaximumWidth(options['width'])
-        self.reader.document().setDefaultFont(QFont('Georgia',options['size']))
-        cursor=QTextCursor(self.reader.document());cursor.select(QTextCursor.SelectionType.Document)
-        block=QTextBlockFormat();block.setLineHeight(options['line'],QTextBlockFormat.LineHeightTypes.ProportionalHeight.value);cursor.mergeBlockFormat(block)
-        self.reader.set_background_options({**options,'background':background})
+        self.reader.document().setDefaultFont(QFont('Georgia', options['size']))
+        cursor = QTextCursor(self.reader.document())
+        cursor.select(QTextCursor.SelectionType.Document)
+        block = QTextBlockFormat()
+        block.setLineHeight(options['line'], QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cursor.mergeBlockFormat(block)
+        self.reader.set_background_options({**options, 'background': t['reader_bg']})
+        if self.current_article_id is not None and hasattr(self, '_apply_annotations'):
+            self._apply_annotations(self.current_article_id)
+        self._refresh_reader_decorations()
 
     def open_display(self):
-        dialog=QDialog(self);dialog.setWindowTitle('阅读显示与背景图');dialog.resize(520,540);layout=QVBoxLayout(dialog)
-        fields={}
-        for key,title,low,high in [('size','字号',10,36),('line','行距（百分比）',110,240),('margin','阅读边距',8,100),('opacity','背景图可见度（百分比）',0,65),('width','正文最大宽度（像素）',520,1800)]:
-            layout.addWidget(QLabel(title));spin=QSpinBox();spin.setRange(low,high);spin.setValue(self.display_options[key]);fields[key]=spin;layout.addWidget(spin)
-        theme=QComboBox()
-        for title,value in [('暖纸色','paper'),('白色','light'),('浅绿色','green'),('深色','dark')]:theme.addItem(title,value)
-        theme.setCurrentIndex(max(0,theme.findData(self.display_options['theme'])));layout.addWidget(theme)
-        selected={'path':self.display_options['image']};image_label=QLabel('已设置背景图' if selected['path'] else '未设置背景图');layout.addWidget(image_label)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('阅读显示与背景图')
+        dialog.resize(520, 560)
+        layout = QVBoxLayout(dialog)
+        fields = {}
+        for key, title, low, high in [
+            ('size', '字号', 10, 36),
+            ('line', '行距（百分比）', 110, 240),
+            ('margin', '阅读边距', 8, 100),
+            ('opacity', '背景图可见度（百分比）', 0, 65),
+            ('width', '正文最大宽度（像素）', 520, 1800),
+        ]:
+            layout.addWidget(QLabel(title))
+            spin = QSpinBox()
+            spin.setRange(low, high)
+            spin.setValue(self.display_options[key])
+            fields[key] = spin
+            layout.addWidget(spin)
+        layout.addWidget(QLabel('全局界面与阅读主题'))
+        theme = QComboBox()
+        for title, value in [('暖纸色', 'paper'), ('明亮白', 'light'), ('护眼浅绿', 'green'), ('深色夜间模式', 'dark')]:
+            theme.addItem(title, value)
+        theme.setCurrentIndex(max(0, theme.findData(self.display_options['theme'])))
+        layout.addWidget(theme)
+        selected = {'path': self.display_options['image']}
+        image_label = QLabel('已设置背景图' if selected['path'] else '未设置背景图')
+        image_label.setObjectName('muted')
+        layout.addWidget(image_label)
+
         def choose():
-            filename,_=QFileDialog.getOpenFileName(dialog,'选择背景图',str(Path.home()),'图片 (*.png *.jpg *.jpeg *.webp *.bmp)')
-            if not filename:return
-            image=QImage(filename)
-            if image.isNull():QMessageBox.warning(dialog,'图片无法读取','请选择有效的图片。');return
-            image=image.scaled(1920,1920,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
-            folder=self.repository.database_path.parent/'backgrounds';folder.mkdir(exist_ok=True)
-            target=folder/(hashlib.sha256(Path(filename).read_bytes()).hexdigest()[:24]+'.jpg')
-            if not image.save(str(target),'JPG',88):QMessageBox.warning(dialog,'保存失败','无法保存所选背景图。');return
-            selected['path']=str(target);image_label.setText('已选择：'+Path(filename).name)
-        row=QHBoxLayout();choose_button=QPushButton('选择自己的背景图');choose_button.clicked.connect(choose);row.addWidget(choose_button)
-        clear=QPushButton('移除背景图');clear.clicked.connect(lambda:(selected.update(path=''),image_label.setText('未设置背景图')));row.addWidget(clear);layout.addLayout(row)
-        layout.addWidget(QLabel('背景图会复制到本机资料目录，移动原图片不会影响阅读。显示设置不跨设备同步。'))
-        save=QPushButton('应用并保存');save.clicked.connect(dialog.accept);layout.addWidget(save)
-        if dialog.exec()==QDialog.DialogCode.Accepted:
-            self.display_options={**{key:spin.value() for key,spin in fields.items()},'theme':theme.currentData(),'image':selected['path']}
-            for key,value in self.display_options.items():self.display_settings.setValue(key,value)
-            self.display_settings.sync();self.apply_display()
+            filename, _ = QFileDialog.getOpenFileName(dialog, '选择背景图', str(Path.home()), '图片 (*.png *.jpg *.jpeg *.webp *.bmp)')
+            if not filename:
+                return
+            image = QImage(filename)
+            if image.isNull():
+                QMessageBox.warning(dialog, '图片无法读取', '请选择有效的图片。')
+                return
+            image = image.scaled(1920, 1920, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            folder = self.repository.database_path.parent / 'backgrounds'
+            folder.mkdir(exist_ok=True)
+            target = folder / (hashlib.sha256(Path(filename).read_bytes()).hexdigest()[:24] + '.jpg')
+            if not image.save(str(target), 'JPG', 88):
+                QMessageBox.warning(dialog, '保存失败', '无法保存所选背景图。')
+                return
+            selected['path'] = str(target)
+            image_label.setText('已选择：' + Path(filename).name)
+
+        row = QHBoxLayout()
+        choose_button = QPushButton('选择自己的背景图')
+        choose_button.clicked.connect(choose)
+        row.addWidget(choose_button)
+        clear = QPushButton('移除背景图')
+        clear.clicked.connect(lambda: (selected.update(path=''), image_label.setText('未设置背景图')))
+        row.addWidget(clear)
+        layout.addLayout(row)
+        note = QLabel('背景图会复制到本机资料目录，移动原图片不会影响阅读。显示设置不跨设备同步。')
+        note.setObjectName('muted')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        save = QPushButton('应用并保存')
+        save.setObjectName('primaryButton')
+        save.clicked.connect(dialog.accept)
+        layout.addWidget(save)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.display_options = {**{key: spin.value() for key, spin in fields.items()}, 'theme': theme.currentData(), 'image': selected['path']}
+            for key, value in self.display_options.items():
+                self.display_settings.setValue(key, value)
+            self.display_settings.sync()
+            self.apply_display()
 
     def _current_sync_id(self):
-        if self.current_article_id is None: return None
-        try: return self.study.sync_id(self.current_article_id)
-        except (TypeError, IndexError): return None
+        if self.current_article_id is None:
+            return None
+        try:
+            return self.study.sync_id(self.current_article_id)
+        except (TypeError, IndexError):
+            return None
+
+    def _refresh_reader_decorations(self, active_span=None):
+        """Render missed-sentence tints together with the active sentence highlight."""
+        if not hasattr(self, 'reader') or not hasattr(self, 'listening'):
+            return
+        if active_span is not None:
+            self._active_sentence_span = active_span
+        t = get_theme(self.display_options.get('theme', 'paper'))
+        text = self.reader.toPlainText()
+        document = self.reader.document()
+        extras = []
+
+        sync_id = self._current_sync_id()
+        if sync_id and text:
+            sentences = self._sentences or sentence_ranges(text)
+            for start, end, _ in self.listening.missed(sync_id, sentences):
+                sel = QTextCursor(document)
+                sel.setPosition(python_offset_to_qt(text, start))
+                sel.setPosition(python_offset_to_qt(text, end), QTextCursor.MoveMode.KeepAnchor)
+                ex = QTextEdit.ExtraSelection()
+                ex.cursor = sel
+                ex.format.setBackground(QColor(t['missed_tint']))
+                extras.append(ex)
+
+        if self._active_sentence_span and text:
+            start, end = self._active_sentence_span
+            sel = QTextCursor(document)
+            sel.setPosition(python_offset_to_qt(text, start))
+            sel.setPosition(python_offset_to_qt(text, end), QTextCursor.MoveMode.KeepAnchor)
+            ex = QTextEdit.ExtraSelection()
+            ex.cursor = sel
+            ex.format.setBackground(QColor(t['sentence_hl']))
+            extras.append(ex)
+
+        self.reader.setExtraSelections(extras)
 
     def _sentence_order(self):
         """Indices visited by 逐句 playback, honouring the replay-missed filter."""
-        if not self._sentences: return []
-        if not self.replay_missed.isChecked(): return list(range(len(self._sentences)))
+        if not self._sentences:
+            return []
+        if not self.replay_missed.isChecked():
+            return list(range(len(self._sentences)))
         sync_id = self._current_sync_id()
-        if sync_id is None: return list(range(len(self._sentences)))
+        if sync_id is None:
+            return list(range(len(self._sentences)))
         missed = {(start, end) for start, end, _ in self.listening.missed(sync_id, self._sentences)}
         order = [i for i, (start, end, _) in enumerate(self._sentences) if (start, end) in missed]
         return order or list(range(len(self._sentences)))
@@ -303,45 +682,63 @@ class StudyUi:
     def _mark_sentence(self, status):
         sync_id = self._current_sync_id()
         if sync_id is None:
-            self._show_hint('请先打开一篇文章，再标记听懂或没听懂。'); return
+            self._show_hint('请先打开一篇文章，再标记听懂或没听懂。')
+            return
         if not self._sentences:
             self._sentences = sentence_ranges(self.reader.toPlainText())
             offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
             self._sentence_index = next((i for i, s in enumerate(self._sentences) if s[1] > offset), 0)
-        if not self._sentences: return
+        if not self._sentences:
+            return
         start, end, text = self._sentences[self._sentence_index]
         after = None if self.listening.status(sync_id, start, end, text) == status else status
         self.listening.mark(sync_id, start, end, text, after)
         label = {'heard': '已标记听懂', 'missed': '已标记没听懂', None: '已清除标记'}[after]
-        self.sentence_label.setText(f'第 {self._sentence_index+1}/{len(self._sentences)} 句 · {label}')
+        self.sentence_label.setText(f'第 {self._sentence_index + 1}/{len(self._sentences)} 句 · {label}')
+        self._show_hint(f'第 {self._sentence_index + 1} 句：{label}。')
         self._refresh_listening_label()
+        self._refresh_reader_decorations()
 
     def _refresh_listening_label(self):
-        if not hasattr(self, 'listening_label'): return
+        if not hasattr(self, 'listening_label'):
+            return
         sync_id = self._current_sync_id()
         if sync_id is None or not self._sentences:
-            self.listening_label.setText(''); return
+            self.listening_label.setText('')
+            return
         missed = len(self.listening.missed(sync_id, self._sentences))
         self.listening_label.setText(f'本篇没听懂 {missed} 句' if missed else '本篇没有待重听句子')
 
     def start_sentences(self):
-        offset=qt_offset_to_python(self.reader.toPlainText(),self.reader.textCursor().position())
+        offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
         self.play_sentence_at(offset)
 
     def play_sentence_at(self, offset):
-        self.stop_audio();self._sentences=sentence_ranges(self.reader.toPlainText())
-        if not self._sentences:return
-        self._sentence_index=next((i for i,s in enumerate(self._sentences) if s[1]>offset),len(self._sentences)-1)
-        self._sentence_round=0;self._sentence_active=True;self._refresh_listening_label();self._play_sentence()
+        self.stop_audio()
+        self._sentences = sentence_ranges(self.reader.toPlainText())
+        if not self._sentences:
+            return
+        self._sentence_index = next((i for i, s in enumerate(self._sentences) if s[1] > offset), len(self._sentences) - 1)
+        self._sentence_round = 0
+        self._sentence_active = True
+        self._refresh_listening_label()
+        self._play_sentence()
 
     def step_sentence(self, direction):
-        if not self._sentences:self._sentences=sentence_ranges(self.reader.toPlainText())
-        if not self._sentences:return
-        order=self._sentence_order()
-        position=order.index(self._sentence_index) if self._sentence_index in order else (-1 if direction>0 else len(order))
-        next_position=position+direction
-        if not 0<=next_position<len(order):return
-        self.stop_audio();self._sentence_index=order[next_position];self._sentence_round=0;self._sentence_active=True;self._play_sentence()
+        if not self._sentences:
+            self._sentences = sentence_ranges(self.reader.toPlainText())
+        if not self._sentences:
+            return
+        order = self._sentence_order()
+        position = order.index(self._sentence_index) if self._sentence_index in order else (-1 if direction > 0 else len(order))
+        next_position = position + direction
+        if not 0 <= next_position < len(order):
+            return
+        self.stop_audio()
+        self._sentence_index = order[next_position]
+        self._sentence_round = 0
+        self._sentence_active = True
+        self._play_sentence()
 
     def keyboard_sentence_step(self, direction):
         """Up/Down in the reader: begin at the current sentence, then step."""
@@ -359,11 +756,11 @@ class StudyUi:
             return
         self._sentence_index = min(max(0, self._sentence_index), len(self._sentences) - 1)
         if not self._sentence_active:
-            # Nothing is playing (first press, or the sequence already finished): take the
-            # sentence under the caret, which the highlight keeps in sync with the ear.
             offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
-            self._sentence_index = next((i for i, sentence in enumerate(self._sentences) if sentence[1] > offset),
-                                        min(self._sentence_index, len(self._sentences) - 1))
+            self._sentence_index = next(
+                (i for i, sentence in enumerate(self._sentences) if sentence[1] > offset),
+                min(self._sentence_index, len(self._sentences) - 1),
+            )
         self.stop_audio()
         self._sentence_active = True
         self._sentence_round = 0
@@ -371,23 +768,14 @@ class StudyUi:
         self._play_sentence()
 
     def _reveal_sentence(self, start, end):
-        """Highlight the current sentence and scroll the reader along with it.
-
-        The caret used to be restored to its previous position straight after
-        ``ensureCursorVisible()``, so Qt scrolled back to the *old* caret and the page
-        never followed the sentence being played. The caret now moves with the
-        highlight, and the scroll bar is positioned from the sentence's own line
-        rectangles because ``ensureCursorVisible`` only guarantees the caret line.
-        """
+        """Highlight the current sentence and scroll the reader along with it."""
         reader = self.reader
         document = reader.document()
+        text = reader.toPlainText()
         selection = QTextCursor(document)
-        selection.setPosition(python_offset_to_qt(reader.toPlainText(), start))
-        selection.setPosition(python_offset_to_qt(reader.toPlainText(), end), QTextCursor.MoveMode.KeepAnchor)
-        extra = QTextEdit.ExtraSelection()
-        extra.cursor = selection
-        extra.format.setBackground(QColor('#70ffcc66'))
-        reader.setExtraSelections([extra])
+        selection.setPosition(python_offset_to_qt(text, start))
+        selection.setPosition(python_offset_to_qt(text, end), QTextCursor.MoveMode.KeepAnchor)
+        self._refresh_reader_decorations((start, end))
 
         caret = QTextCursor(document)
         caret.setPosition(selection.selectionStart())
@@ -406,144 +794,368 @@ class StudyUi:
         if top < padding:
             bar.setValue(bar.value() + top - padding)
         elif bottom > height - padding:
-            # A sentence taller than the viewport keeps its first line at the top.
             offset = top - padding if bottom - top > height - 2 * padding else bottom - height + padding
             bar.setValue(bar.value() + offset)
 
     def _play_sentence(self):
-        if not self._sentence_active:return
-        start,end,text=self._sentences[self._sentence_index]
+        if not self._sentence_active:
+            return
+        start, end, text = self._sentences[self._sentence_index]
         self._reveal_sentence(start, end)
-        self.sentence_label.setText(f'第 {self._sentence_index+1}/{len(self._sentences)} 句 · 第 {self._sentence_round+1}/{self.sentence_repeat.value()} 遍')
-        self._sentence_spoken=False;self._speak_system(text)
+        self.sentence_label.setText(f'第 {self._sentence_index + 1}/{len(self._sentences)} 句 · 第 {self._sentence_round + 1}/{self.sentence_repeat.value()} 遍')
+        self._sentence_spoken = False
+        self._speak_system(text)
 
-    def _sentence_speech_state(self,state):
-        if not self._sentence_active:return
-        if state==QTextToSpeech.State.Speaking:self._sentence_spoken=True
-        if state==QTextToSpeech.State.Error:self.cancel_sentence_sequence();return
-        if state!=QTextToSpeech.State.Ready or not self._sentence_spoken:return
-        self._sentence_spoken=False;self._sentence_round+=1
-        if self._sentence_round>=self.sentence_repeat.value():
-            order=self._sentence_order()
-            position=order.index(self._sentence_index) if self._sentence_index in order else -1
-            if self.single_sentence.isChecked() or position+1>=len(order):
-                self.cancel_sentence_sequence();self.sentence_label.setText('逐句朗读完成');return
-            self._sentence_index=order[position+1];self._sentence_round=0
-        self.sentence_timer.start(int(self.sentence_gap.value()*1000))
+    def _sentence_speech_state(self, state):
+        if not self._sentence_active:
+            return
+        if state == QTextToSpeech.State.Speaking:
+            self._sentence_spoken = True
+        if state == QTextToSpeech.State.Error:
+            self.cancel_sentence_sequence()
+            return
+        if state != QTextToSpeech.State.Ready or not self._sentence_spoken:
+            return
+        self._sentence_spoken = False
+        self._sentence_round += 1
+        if self._sentence_round >= self.sentence_repeat.value():
+            order = self._sentence_order()
+            position = order.index(self._sentence_index) if self._sentence_index in order else -1
+            if self.single_sentence.isChecked() or position + 1 >= len(order):
+                self.cancel_sentence_sequence()
+                self.sentence_label.setText('逐句朗读完成')
+                return
+            self._sentence_index = order[position + 1]
+            self._sentence_round = 0
+        self.sentence_timer.start(int(self.sentence_gap.value() * 1000))
 
     def cancel_sentence_sequence(self):
-        self._sentence_active=False;self._sentence_spoken=False;self._gap_paused=False
-        if hasattr(self,'sentence_timer'):self.sentence_timer.stop()
-        if hasattr(self,'reader'):self.reader.setExtraSelections([])
+        self._sentence_active = False
+        self._sentence_spoken = False
+        self._gap_paused = False
+        self._active_sentence_span = None
+        if hasattr(self, 'sentence_timer'):
+            self.sentence_timer.stop()
+        if hasattr(self, 'reader'):
+            self._refresh_reader_decorations(None)
 
     def open_dictation(self):
         sentences = sentence_ranges(self.reader.toPlainText())
         if not sentences:
-            self._show_hint('当前没有打开的文章，或文章正文为空。'); return
+            self._show_hint('当前没有打开的文章，或文章正文为空。')
+            return
         offset = qt_offset_to_python(self.reader.toPlainText(), self.reader.textCursor().position())
         state = {'index': next((i for i, s in enumerate(sentences) if s[1] > offset), 0), 'results': {}}
-        dialog = QDialog(self); dialog.setWindowTitle('听写练习'); dialog.resize(780, 640)
-        dialog.finished.connect(lambda _code: self.stop_audio())
+        dialog = QDialog(self)
+        dialog.setWindowTitle('听写练习')
+        dialog.resize(800, 660)
+
+        def on_close(_code):
+            self.stop_audio()
+            if state['results']:
+                sync_id = self._current_sync_id() or ''
+                scores = list(state['results'].values())
+                self.listening.record_dictation(sync_id, len(scores), sum(scores) / len(scores))
+
+        dialog.finished.connect(on_close)
         layout = QVBoxLayout(dialog)
-        info = QLabel(); info.setWordWrap(True); layout.addWidget(info)
-        typed = QTextEdit(); typed.setPlaceholderText('听一句，敲一句；没听清的词先跳过，对照后再补。'); layout.addWidget(typed, 1)
-        feedback = QTextBrowser(); feedback.setOpenExternalLinks(False); layout.addWidget(feedback, 1)
+        info = QLabel()
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        typed = QTextEdit()
+        typed.setPlaceholderText('听一句，敲一句；没听清的词先跳过，对照后再补。Ctrl+R 重播，Ctrl+Enter 对照答案。')
+        layout.addWidget(typed, 1)
+        feedback = QTextBrowser()
+        feedback.setOpenLinks(False)
+        feedback.setOpenExternalLinks(False)
+        layout.addWidget(feedback, 1)
+
+        def on_anchor(url: QUrl):
+            raw = url.toString()
+            if not raw.startswith('addword:'):
+                return
+            word = raw[len('addword:'):].strip()
+            if not word:
+                return
+            sentence_text = sentences[state['index']][2]
+            meaning = cached_translation(word)
+            if not meaning:
+                try:
+                    meaning = lookup_chinese(word, timeout=2.5)
+                except Exception:
+                    meaning = ''
+            try:
+                self.repository.add_manual_vocabulary(word, meaning, sentence_text)
+                self.refresh_vocabulary()
+                info.setText(f'已将错词 “{word}” 加入生词本！' + (f'（{meaning.splitlines()[0][:36]}）' if meaning else ''))
+            except ValueError as err:
+                info.setText(str(err))
+
+        feedback.anchorClicked.connect(on_anchor)
+
+        def show_translation():
+            sentence_text = sentences[state['index']][2]
+            meaning = cached_translation(sentence_text)
+            if not meaning:
+                try:
+                    meaning = lookup_chinese(sentence_text, timeout=3.0)
+                except Exception as err:
+                    meaning = str(err)
+            feedback.append(f'<div style="margin-top:8px;color:#64748b;">中文参考：{html.escape(meaning)}</div>')
+
         row = QHBoxLayout()
-        for title, callback in [('上一句', lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, -1)),
-                                ('▶ 播放本句', lambda: self._dictation_play(sentences, state)),
-                                ('对照答案', lambda: self._dictation_check(sentences, state, typed, feedback, info)),
-                                ('下一句 ▶', lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, 1))]:
-            button = QPushButton(title); button.clicked.connect(callback); row.addWidget(button)
+        for title, callback in [
+            ('上一句 (Ctrl+←)', lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, -1)),
+            ('▶ 播放本句 (Ctrl+R)', lambda: self._dictation_play(sentences, state)),
+            ('对照答案 (Ctrl+Enter)', lambda: self._dictation_check(sentences, state, typed, feedback, info)),
+            ('参考译文', show_translation),
+            ('下一句 ▶ (Ctrl+→)', lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, 1)),
+        ]:
+            button = QPushButton(title)
+            if '对照答案' in title:
+                button.setObjectName('primaryButton')
+            button.clicked.connect(callback)
+            row.addWidget(button)
         layout.addLayout(row)
-        layout.addWidget(QLabel('听写按当前发音语速朗读一遍；先用“逐句 + 只循环当前句”精听，再来这里检验。'))
+
+        QShortcut(QKeySequence('Ctrl+R'), dialog, activated=lambda: self._dictation_play(sentences, state))
+        QShortcut(QKeySequence('Ctrl+Return'), dialog, activated=lambda: self._dictation_check(sentences, state, typed, feedback, info))
+        QShortcut(QKeySequence('Ctrl+Enter'), dialog, activated=lambda: self._dictation_check(sentences, state, typed, feedback, info))
+        QShortcut(QKeySequence('Ctrl+Right'), dialog, activated=lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, 1))
+        QShortcut(QKeySequence('Ctrl+Left'), dialog, activated=lambda: self._dictation_move(dialog, sentences, state, typed, feedback, info, -1))
+
+        tip = QLabel('提示：对照后直接点击红色写错/漏写词即可一键加入生词本。快捷键：Ctrl+R 重播 · Ctrl+Enter 对照 · Ctrl+←/→ 换句。')
+        tip.setObjectName('muted')
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
         self._dictation_show(sentences, state, typed, feedback, info)
         dialog.exec()
 
     def _dictation_show(self, sentences, state, typed, feedback, info):
-        typed.clear(); feedback.clear()
-        info.setText(f'第 {state["index"]+1}/{len(sentences)} 句 · 原文已隐藏，播放后听写。')
+        typed.clear()
+        feedback.clear()
+        info.setText(f'第 {state["index"] + 1}/{len(sentences)} 句 · 原文已隐藏，播放后听写。')
 
     def _dictation_play(self, sentences, state):
-        self.stop_audio(); self._speak_system(sentences[state['index']][2])
+        self.stop_audio()
+        self._speak_system(sentences[state['index']][2])
 
     def _dictation_check(self, sentences, state, typed, feedback, info):
         result = compare(sentences[state['index']][2], typed.toPlainText())
         parts = []
         for word, status in zip(result['expected'], result['statuses']):
             safe = html.escape(word)
-            if status == 'ok': parts.append(safe)
-            elif status == 'wrong': parts.append(f'<b style="color:#c0392b;text-decoration:underline">{safe}</b>')
-            else: parts.append(f'<b style="color:#c0392b">[{safe}]</b>')
+            clean_word = re.sub(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$", '', word)
+            href = html.escape(clean_word or word)
+            if status == 'ok':
+                parts.append(safe)
+            elif status == 'wrong':
+                parts.append(f'<a href="addword:{href}" style="color:#d93829;font-weight:700;text-decoration:underline;">{safe}</a>')
+            else:
+                parts.append(f'<a href="addword:{href}" style="color:#d93829;font-weight:700;text-decoration:none;">[{safe}]</a>')
         extras = f'<br>多写的词：{html.escape(" ".join(result["extra"]))}' if result['extra'] else ''
-        feedback.setHtml('正确答案：' + ' '.join(parts) + extras + f'<br>本句准确率 {result["accuracy"]*100:.0f}%（红=写错，[红]=漏写）')
+        feedback.setHtml(
+            '正确答案：' + ' '.join(parts) + extras +
+            f'<br><br>本句准确率 <b>{result["accuracy"] * 100:.0f}%</b>（红下划线=写错，[红]=漏写；点击红色词可直接加入生词本）'
+        )
         state['results'][state['index']] = result['accuracy']
         scores = list(state['results'].values())
-        info.setText(f'第 {state["index"]+1}/{len(sentences)} 句 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores)/len(scores)*100:.0f}%')
+        info.setText(f'第 {state["index"] + 1}/{len(sentences)} 句 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores) / len(scores) * 100:.0f}%')
 
     def _dictation_move(self, dialog, sentences, state, typed, feedback, info, direction):
         target = state['index'] + direction
-        if target < 0: return
+        if target < 0:
+            return
         if target >= len(sentences):
             if state['results']:
                 scores = list(state['results'].values())
-                info.setText(f'全文听写结束 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores)/len(scores)*100:.0f}%')
+                info.setText(f'全文听写结束 · 已对照 {len(scores)} 句 · 平均准确率 {sum(scores) / len(scores) * 100:.0f}%')
             else:
                 info.setText('已到最后一句。')
             return
-        state['index'] = target; self._dictation_show(sentences, state, typed, feedback, info); self._dictation_play(sentences, state)
+        state['index'] = target
+        self._dictation_show(sentences, state, typed, feedback, info)
+        self._dictation_play(sentences, state)
+
+    def open_stats(self):
+        stats = self.study.stats(article_info=self._vocabulary_article_info(), listening=self.listening)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('学习统计 · 英语阅读标记器')
+        dialog.resize(680, 520)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(14)
+
+        title = QLabel('学习概览')
+        title.setObjectName('sectionTitle')
+        layout.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        cards = [
+            ('文章阅读', f"{stats['read_articles']} / {stats['total_articles']} 篇", f"累计约 {stats['total_words']:,} 词"),
+            ('生词积累', f"{stats['total_vocab']} 条", f"已掌握 {stats['mastered_vocab']} 条（间隔≥7天）"),
+            ('待复习生词', f"{stats['due_vocab']} 条", f"累计完成复习 {stats['total_reviews']} 次"),
+            ('精读标记', f"{stats['total_annotations']} 处划线", f"句子收藏与笔记 {stats['total_notes']} 条"),
+            ('听写训练', f"{stats['dictation_sessions']} 次",
+             f"平均准确率 {stats['dictation_avg_accuracy'] * 100:.0f}%" if stats['dictation_sessions'] else '尚未完成听写练习'),
+        ]
+        for idx, (heading, big, sub) in enumerate(cards):
+            card = QFrame()
+            card.setObjectName('statCard')
+            cl = QVBoxLayout(card)
+            cl.setSpacing(4)
+            h = QLabel(heading)
+            h.setObjectName('muted')
+            v = QLabel(big)
+            v.setStyleSheet('font-size: 18pt; font-weight: 700;')
+            s = QLabel(sub)
+            s.setObjectName('muted')
+            cl.addWidget(h)
+            cl.addWidget(v)
+            cl.addWidget(s)
+            grid.addWidget(card, idx // 3, idx % 3)
+        layout.addLayout(grid)
+
+        cat_panel = QFrame()
+        cat_panel.setObjectName('panel')
+        cat_layout = QVBoxLayout(cat_panel)
+        cat_layout.setContentsMargins(16, 14, 16, 14)
+        cat_title = QLabel('生词分类分布')
+        cat_title.setObjectName('sectionTitle')
+        cat_layout.addWidget(cat_title)
+        total_v = max(1, stats['total_vocab'])
+        if stats['category_counts']:
+            for name, count in stats['category_counts'][:8]:
+                row = QHBoxLayout()
+                lbl = QLabel(f'{name}（{count}）')
+                lbl.setMinimumWidth(120)
+                bar = QProgressBar()
+                bar.setRange(0, total_v)
+                bar.setValue(count)
+                bar.setTextVisible(False)
+                row.addWidget(lbl)
+                row.addWidget(bar, 1)
+                cat_layout.addLayout(row)
+        else:
+            empty = QLabel('暂无生词记录。')
+            empty.setObjectName('muted')
+            cat_layout.addWidget(empty)
+        layout.addWidget(cat_panel, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        review_btn = QPushButton('去复习到期生词')
+        review_btn.setObjectName('primaryButton')
+        review_btn.clicked.connect(lambda: (dialog.accept(), self.open_review()))
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dialog.accept)
+        actions.addWidget(review_btn)
+        actions.addWidget(close_btn)
+        layout.addLayout(actions)
+        dialog.exec()
 
     def open_backup_manager(self):
-        dialog=QDialog(self);dialog.setWindowTitle('数据与备份恢复');dialog.resize(760,610);layout=QVBoxLayout(dialog)
-        label=QLabel('资料位置：'+str(self.repository.database_path.parent)+'\n每天首次打开自动备份（自动保留最近 30 份每日快照）；恢复前还会保存当前资料。');label.setWordWrap(True);layout.addWidget(label)
-        cache_label=QLabel();layout.addWidget(cache_label)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('数据与备份恢复')
+        dialog.resize(760, 610)
+        layout = QVBoxLayout(dialog)
+        label = QLabel('资料位置：' + str(self.repository.database_path.parent) + '\n每天首次打开自动备份（自动保留最近 30 份每日快照）；恢复前还会保存当前资料。')
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        cache_label = QLabel()
+        layout.addWidget(cache_label)
+
         def refresh_cache_label():
             count, size = audio_cache_stats(self.repository.database_path.parent)
             cache_label.setText(f'本地语音缓存：{count} 个音频文件（{size / 1048576:.1f} MB）')
+
         refresh_cache_label()
-        listing=QListWidget();layout.addWidget(listing,1);detail=QTextBrowser();layout.addWidget(detail,1)
+        listing = QListWidget()
+        layout.addWidget(listing, 1)
+        detail = QTextBrowser()
+        layout.addWidget(detail, 1)
+
         def add(path):
             try:
-                data=backup_details(path);item=QListWidgetItem(f"{data['modified']} · {data['articles']}篇 · {data['annotations']}处划线 · {data['vocabulary']}条生词 · {Path(path).name}")
-                item.setData(Qt.ItemDataRole.UserRole,data);listing.addItem(item)
-            except Exception:pass
+                data = backup_details(path)
+                item = QListWidgetItem(f"{data['modified']} · {data['articles']}篇 · {data['annotations']}处划线 · {data['vocabulary']}条生词 · {Path(path).name}")
+                item.setData(Qt.ItemDataRole.UserRole, data)
+                listing.addItem(item)
+            except Exception:
+                pass
+
         def refresh():
             listing.clear()
-            for path in sorted((self.repository.database_path.parent/'backups').glob('*.sqlite3'),reverse=True):add(path)
-            if listing.count():listing.setCurrentRow(0)
+            for path in sorted((self.repository.database_path.parent / 'backups').glob('*.sqlite3'), reverse=True):
+                add(path)
+            if listing.count():
+                listing.setCurrentRow(0)
+
         def show():
-            item=listing.currentItem()
+            item = listing.currentItem()
             if item:
-                d=item.data(Qt.ItemDataRole.UserRole);detail.setPlainText('文章：\n'+'\n'.join(d['titles'])+f"\n\n句子收藏 {d['notes']} 条 · 复习记录 {d['reviews']} 条\n"+d['path'])
+                d = item.data(Qt.ItemDataRole.UserRole)
+                detail.setPlainText('文章：\n' + '\n'.join(d['titles']) + f"\n\n句子收藏 {d['notes']} 条 · 复习记录 {d['reviews']} 条\n" + d['path'])
+
         def backup():
-            try:backup_database(self.repository.database_path);refresh();QMessageBox.information(dialog,'备份完成','当前资料已完整备份。')
-            except Exception as error:QMessageBox.warning(dialog,'备份失败',str(error))
+            try:
+                backup_database(self.repository.database_path)
+                refresh()
+                QMessageBox.information(dialog, '备份完成', '当前资料已完整备份。')
+            except Exception as error:
+                QMessageBox.warning(dialog, '备份失败', str(error))
+
         def choose():
-            filename,_=QFileDialog.getOpenFileName(dialog,'选择阅读器备份',str(Path.home()),'阅读器数据库 (*.sqlite3)')
+            filename, _ = QFileDialog.getOpenFileName(dialog, '选择阅读器备份', str(Path.home()), '阅读器数据库 (*.sqlite3)')
             if filename:
-                try:backup_details(filename);add(filename);listing.setCurrentRow(listing.count()-1)
-                except Exception as error:QMessageBox.warning(dialog,'无法读取',str(error))
+                try:
+                    backup_details(filename)
+                    add(filename)
+                    listing.setCurrentRow(listing.count() - 1)
+                except Exception as error:
+                    QMessageBox.warning(dialog, '无法读取', str(error))
+
         def restore():
-            item=listing.currentItem()
-            if not item:return
-            d=item.data(Qt.ItemDataRole.UserRole)
-            question=f"恢复为这份备份？\n{d['articles']}篇文章、{d['annotations']}处划线、{d['vocabulary']}条生词、{d['notes']}条收藏。\n\n会先备份当前资料，然后退出。再次从桌面打开时完成恢复。\n手机尚未同步的修改以后仍可能补传，请先确认手机上的资料。"
-            if QMessageBox.question(dialog,'确认恢复并退出',question,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+            item = listing.currentItem()
+            if not item:
+                return
+            d = item.data(Qt.ItemDataRole.UserRole)
+            question = (
+                f"恢复为这份备份？\n{d['articles']}篇文章、{d['annotations']}处划线、{d['vocabulary']}条生词、{d['notes']}条收藏。\n\n"
+                "会先备份当前资料，然后退出。再次从桌面打开时完成恢复。\n"
+                "手机尚未同步的修改以后仍可能补传，请先确认手机上的资料。"
+            )
+            if QMessageBox.question(dialog, '确认恢复并退出', question, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
             try:
                 self.stop_audio()
-                if self.sync_service:self.sync_service.stop()
-                schedule_restore(Path(d['path']),self.repository.database_path)
-            except Exception as error:QMessageBox.warning(dialog,'恢复未执行',str(error));return
-            dialog.accept();self.close();self.application_quit()
+                if self.sync_service:
+                    self.sync_service.stop()
+                schedule_restore(Path(d['path']), self.repository.database_path)
+            except Exception as error:
+                QMessageBox.warning(dialog, '恢复未执行', str(error))
+                return
+            dialog.accept()
+            self.close()
+            self.application_quit()
+
         def clean_cache():
-            if QMessageBox.question(dialog,'清理语音缓存','删除本地缓存的词典发音与神经网络语音文件？\n不影响文章、划线和生词，下次朗读时按需重新下载。')!=QMessageBox.StandardButton.Yes:return
+            if QMessageBox.question(dialog, '清理语音缓存', '删除本地缓存的词典发音与神经网络语音文件？\n不影响文章、划线和生词，下次朗读时按需重新下载。') != QMessageBox.StandardButton.Yes:
+                return
             self.stop_audio()
-            removed=clear_audio_cache(self.repository.database_path.parent)
+            removed = clear_audio_cache(self.repository.database_path.parent)
             refresh_cache_label()
-            QMessageBox.information(dialog,'清理完成',f'已清理 {removed} 个缓存音频文件。')
-        row=QHBoxLayout()
-        for title,action in [('立即备份',backup),('选择备份文件',choose),('清理语音缓存',clean_cache),('恢复所选并退出',restore)]:
-            button=QPushButton(title);button.clicked.connect(action);row.addWidget(button)
-        layout.addLayout(row);listing.currentItemChanged.connect(show);refresh();dialog.exec()
+            QMessageBox.information(dialog, '清理完成', f'已清理 {removed} 个缓存音频文件。')
+
+        row = QHBoxLayout()
+        for title, action in [('立即备份', backup), ('选择备份文件', choose), ('清理语音缓存', clean_cache), ('恢复所选并退出', restore)]:
+            button = QPushButton(title)
+            button.clicked.connect(action)
+            row.addWidget(button)
+        layout.addLayout(row)
+        listing.currentItemChanged.connect(show)
+        refresh()
+        dialog.exec()
 
     def application_quit(self):
         from PySide6.QtWidgets import QApplication

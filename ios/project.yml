@@ -46,8 +46,8 @@ targets:
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/EnglishReadingMarker.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"          # iPhone + iPad（安卓那套 layoutlib 也只区分手机/平板）
-        CURRENT_PROJECT_VERSION: "9"           # 对齐安卓 versionCode
-        MARKETING_VERSION: "1.8.0"             # 对齐安卓 versionName
+        CURRENT_PROJECT_VERSION: "11"          # 对齐安卓 versionCode
+        MARKETING_VERSION: "1.9.1"             # 对齐安卓 versionName
         SWIFT_INCLUDE_PATHS: $(SRCROOT)/CHeaders
         HEADER_SEARCH_PATHS: $(SRCROOT)/CHeaders
         # 对应安卓「本地 SQLite」：iOS 不需要打包 sqlcipher，用系统 libsqlite3 就够

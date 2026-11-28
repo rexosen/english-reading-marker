@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,49 +18,67 @@ if getattr(sys, "frozen", False):
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, QLocale, QPoint, QTimer, QUrl, QSettings, QLockFile
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor, QFont, QDesktopServices, QPainter, QImage
+from PySide6.QtGui import QAction, QColor, QIcon, QTextCharFormat, QTextCursor, QFont, QDesktopServices, QPainter, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
-    QInputDialog,
-    QComboBox,
-    QMenu,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
-    QSplitter,
     QSizePolicy,
-    QTextEdit,
+    QSplitter,
     QTextBrowser,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from src.dictionary import DictionaryError, lookup_chinese, cached_translation
+from src.dictionary import (
+    DictionaryError,
+    cached_translation,
+    format_translation_html,
+    lookup_chinese,
+    lookup_local_entry,
+)
 from src.domain import (
     find_selected_phrase,
-    normalize_line_endings,
     normalize_article_text,
+    normalize_line_endings,
     python_offset_to_qt,
     qt_offset_to_python,
     trim_range,
 )
 from src.exporter import export_vocabulary_csv
-from src.repository import ReaderRepository
-from src.storage import prepare_storage, backup_database, StorageError, data_directory
-from src.study_ui import StudyUi
+from src.importers import SUPPORTED_EXTENSIONS, import_article_file, render_qr_pixmap
 from src.lan_sync import LanSyncService
-from src.pronunciation import pronunciation_file, PronunciationError, audio_word
 from src.neural_speech import NeuralSpeech
+from src.pronunciation import PronunciationError, audio_word, pronunciation_file
+from src.repository import ReaderRepository
+from src.storage import StorageError, backup_database, data_directory, prepare_storage
+from src.study_ui import StudyUi
+from src.theme import (
+    ARTICLE_META_ROLE,
+    ArticleCardDelegate,
+    VocabularyCardDelegate,
+    build_stylesheet,
+    get_theme,
+    is_dark_theme,
+    make_svg_icon,
+)
 
 
 APP_NAME = "英语阅读标记器"
@@ -107,34 +126,41 @@ class ReadingTextEdit(QTextEdit):
     sentence_step_requested = Signal(int)
     sentence_repeat_requested = Signal()
     speech_speed_requested = Signal(float)
+    listening_mark_requested = Signal(str)
 
     def set_background_options(self, options):
         self._background_options = options
-        self._background_image = QImage(str(options.get('image','')))
+        self._background_image = QImage(str(options.get("image", "")))
         self._scaled_background = None
         self.viewport().update()
 
     def paintEvent(self, event):
-        options = getattr(self, '_background_options', {})
+        options = getattr(self, "_background_options", {})
         painter = QPainter(self.viewport())
-        painter.fillRect(self.viewport().rect(), QColor(options.get('background','#fff9ed')))
-        image = getattr(self, '_background_image', QImage())
+        painter.fillRect(self.viewport().rect(), QColor(options.get("background", "#fffaf0")))
+        image = getattr(self, "_background_image", QImage())
         if not image.isNull():
             if self._scaled_background is None or self._scaled_background[0] != self.viewport().size():
-                self._scaled_background = (self.viewport().size(), image.scaled(self.viewport().size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+                self._scaled_background = (
+                    self.viewport().size(),
+                    image.scaled(
+                        self.viewport().size(),
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    ),
+                )
             scaled = self._scaled_background[1]
-            painter.setOpacity(int(options.get('opacity',22))/100)
-            painter.drawImage((self.viewport().width()-scaled.width())//2,(self.viewport().height()-scaled.height())//2,scaled)
+            painter.setOpacity(int(options.get("opacity", 22)) / 100)
+            painter.drawImage(
+                (self.viewport().width() - scaled.width()) // 2,
+                (self.viewport().height() - scaled.height()) // 2,
+                scaled,
+            )
         painter.end()
         super().paintEvent(event)
 
     def keyPressEvent(self, event):
-        """Space pauses/resumes reading; Up/Down step between sentences; Left/Right replay.
-
-        The number keys switch the reading speed (1 = 1x, 2 = 0.75x). Only plain keys
-        are captured, so Ctrl/Shift combinations and PageUp/PageDown keep their normal
-        cursor and scrolling behaviour.
-        """
+        """Space pauses/resumes; Up/Down step; Left/Right replay; 1/2 speed; Y/N listening mark."""
         if event.modifiers() == Qt.KeyboardModifier.NoModifier:
             if event.key() == Qt.Key.Key_Space:
                 event.accept()
@@ -156,12 +182,21 @@ class ReadingTextEdit(QTextEdit):
                 event.accept()
                 self.speech_speed_requested.emit(0.75)
                 return
+            if event.key() == Qt.Key.Key_Y:
+                event.accept()
+                self.listening_mark_requested.emit("heard")
+                return
+            if event.key() == Qt.Key.Key_N:
+                event.accept()
+                self.listening_mark_requested.emit("missed")
+                return
         super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         super().mouseDoubleClickEvent(event)
-        self.sentence_requested.emit(qt_offset_to_python(self.toPlainText(), self.cursorForPosition(event.position().toPoint()).position()))
-
+        self.sentence_requested.emit(
+            qt_offset_to_python(self.toPlainText(), self.cursorForPosition(event.position().toPoint()).position())
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
@@ -197,22 +232,20 @@ class ReadingTextEdit(QTextEdit):
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event):
-        # Right release already starts translation; suppress the standard edit menu.
         event.accept()
 
 
 class VocabularyList(QListWidget):
-    """The list in the vocabulary book.
+    """The list in the vocabulary book."""
 
-    ``QListWidget`` has no ``deletePressed`` (that is QTableWidget/QTreeWidget), so the
-    Delete key is handled here and turned into a signal the window can confirm on.
-    """
     delete_requested = Signal()
 
     def keyPressEvent(self, event):
-        if (event.modifiers() == Qt.KeyboardModifier.NoModifier
-                and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
-                and self.selectedItems()):
+        if (
+            event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+            and self.selectedItems()
+        ):
             event.accept()
             self.delete_requested.emit()
             return
@@ -265,19 +298,31 @@ class VocabularyEntryDialog(QDialog):
         layout.addLayout(buttons)
 
     def values(self) -> dict:
-        return {"word": " ".join(self.word_input.text().split()),
-                "definition": self.definition_input.toPlainText().strip(),
-                "context": self.context_input.toPlainText().strip(),
-                "category": self.category_box.currentData()}
+        return {
+            "word": " ".join(self.word_input.text().split()),
+            "definition": self.definition_input.toPlainText().strip(),
+            "context": self.context_input.toPlainText().strip(),
+            "category": self.category_box.currentData(),
+        }
 
 
 class TranslationView(QTextBrowser):
-    """Scrollable plain text that never imposes the content's width on the layout."""
+    """Scrollable rich text that preserves exact plain text for .text() callers."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._plain_text = ""
+
     def setText(self, text):
-        self.setPlainText(text)
+        self._plain_text = str(text or "")
+        self.setPlainText(self._plain_text)
+
+    def set_rich(self, plain: str, html_text: str):
+        self._plain_text = str(plain or "")
+        self.setHtml(html_text)
 
     def text(self):
-        return self.toPlainText()
+        return self._plain_text or self.toPlainText()
 
 
 class ArticleEditorDialog(QDialog):
@@ -296,13 +341,13 @@ class ArticleEditorDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("文章正文"))
         row.addStretch(1)
-        import_button = QPushButton("从 TXT 导入")
+        import_button = QPushButton("从文件导入 (TXT / MD / EPUB / PDF)")
         import_button.clicked.connect(self.import_text)
         row.addWidget(import_button)
         layout.addLayout(row)
 
         self.body_input = QTextEdit()
-        self.body_input.setPlaceholderText("粘贴转换后的文章文本，检查后保存……")
+        self.body_input.setPlaceholderText("粘贴文章文本，或拖入 TXT / Markdown / EPUB / PDF 文件……")
         self.body_input.setPlainText(normalize_line_endings(text))
         layout.addWidget(self.body_input, 1)
 
@@ -319,18 +364,20 @@ class ArticleEditorDialog(QDialog):
 
     def import_text(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "导入文本文章", str(Path.home()), "文本文件 (*.txt);;所有文件 (*)"
+            self,
+            "导入文章",
+            str(Path.home()),
+            "支持的文件 (*.txt *.md *.markdown *.epub *.pdf);;文本文件 (*.txt);;所有文件 (*)",
         )
         if not file_path:
             return
-        path = Path(file_path)
-        raw = path.read_bytes()
         try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
+            stem, text = import_article_file(Path(file_path))
+        except Exception as error:
+            QMessageBox.warning(self, "导入失败", str(error))
+            return
         if not self.title_input.text().strip():
-            self.title_input.setText(path.stem)
+            self.title_input.setText(stem)
         self.body_input.setPlainText(normalize_line_endings(text))
 
     def article(self) -> tuple[str, str]:
@@ -348,10 +395,12 @@ class MainWindow(StudyUi, QMainWindow):
         self.current_definition = ""
         self.definition_selection: tuple[int, int, str] | None = None
         self.lookup_request_id = 0
+        self._pending_auto_save_request_id: int | None = None
         self.translation_popup = None
         self.sync_service = None
         self._sync_revision = repository.sync_revision()
         self._loading_article = False
+        self._current_theme_name = "paper"
         self.speech = QTextToSpeech("sapi", self)
         self.speech.setLocale(QLocale("en_US"))
         self.audio_settings = QSettings(str(repository.database_path.parent / "audio.ini"), QSettings.Format.IniFormat)
@@ -374,9 +423,9 @@ class MainWindow(StudyUi, QMainWindow):
         self.neural.errorOccurred.connect(self._on_neural_failed)
 
         self.setWindowTitle(APP_NAME)
+        self.setAcceptDrops(True)
         self.resize(1420, 900)
         self.setMinimumSize(1080, 720)
-        self.setStyleSheet(self._style_sheet())
         self._build_ui()
         self.init_study_ui()
         self.menuBar().addAction("数据与备份", self.open_backup_manager)
@@ -392,56 +441,73 @@ class MainWindow(StudyUi, QMainWindow):
         self.progress_timer.setSingleShot(True)
         self.progress_timer.setInterval(500)
         self.progress_timer.timeout.connect(self.save_reading_progress)
-        self.reader.verticalScrollBar().valueChanged.connect(lambda: self.progress_timer.start() if not self._loading_article else None)
+        self.reader.verticalScrollBar().valueChanged.connect(self._on_reader_scrolled)
         self.auto_start_sync = str(self.audio_settings.value("auto_start_sync", "false")).lower() == "true"
         if self.auto_start_sync:
             self._start_sync_service_silent()
 
-    @staticmethod
-    def _style_sheet() -> str:
-        return """
-        QWidget { color: #203044; font-family: "Microsoft YaHei UI"; font-size: 10pt; }
-        QMainWindow, QWidget#root { background: #f4f6fa; }
-        QLabel#brand { color: #66758b; font-size: 9pt; font-weight: 700; letter-spacing: 1px; }
-        QLabel#pageTitle { color: #17283e; font-size: 21pt; font-weight: 700; }
-        QLabel#sectionTitle { color: #203044; font-size: 12pt; font-weight: 700; }
-        QLabel#muted { color: #78869a; }
-        QFrame#panel { background: white; border: 1px solid #e5eaf1; border-radius: 14px; }
-        QListWidget { background: transparent; border: 0; outline: 0; padding: 4px; }
-        QListWidget::item { padding: 12px 10px; border-radius: 8px; margin: 2px 0; }
-        QListWidget::item:selected { background: #e9f0ff; color: #2558b8; }
-        QListWidget::item:hover { background: #f1f5fb; }
-        QTextEdit { background: #fff; border: 1px solid #e5eaf1; border-radius: 12px; padding: 22px; selection-background-color: #cfe0ff; font-family: "Georgia", "Times New Roman"; font-size: 14pt; line-height: 1.7; }
-        QPushButton, QToolButton { background: #f2f5fa; border: 1px solid #e2e8f1; border-radius: 8px; padding: 9px 13px; }
-        QPushButton:hover, QToolButton:hover { background: #e9eef6; }
-        QPushButton#primaryButton { background: #315fbd; color: white; border: 0; font-weight: 700; }
-        QPushButton#primaryButton:hover { background: #264f9f; }
-        QLineEdit { padding: 10px; border: 1px solid #dfe5ed; border-radius: 8px; background: white; }
-        QLabel#definition { color: #244a93; font-size: 14pt; font-weight: 700; }
-        """
+    def apply_global_theme(self, theme_name: str) -> None:
+        self._current_theme_name = theme_name
+        t = get_theme(theme_name)
+        qss = build_stylesheet(theme_name)
+        self.setStyleSheet(qss)
+        if hasattr(self, "vocabulary_dialog"):
+            self.vocabulary_dialog.setStyleSheet(qss)
+        if hasattr(self, "article_delegate"):
+            self.article_delegate.set_theme(theme_name)
+            self.article_list.viewport().update()
+        if hasattr(self, "vocab_delegate"):
+            self.vocab_delegate.set_theme(theme_name)
+            self.vocabulary_list.viewport().update()
+        # Refresh monochrome SVG icons to match theme text color
+        icon_color = t["text"]
+        if hasattr(self, "_themed_icons"):
+            for widget, icon_name, is_primary in self._themed_icons:
+                widget.setIcon(make_svg_icon(icon_name, "#ffffff" if is_primary else icon_color, 16))
+        if hasattr(self, "definition_label"):
+            self.definition_label.setStyleSheet(
+                f'font-family: "Microsoft YaHei UI"; font-size: 10.5pt; padding: 6px; border: 0; background: transparent; color: {t["text"]};'
+            )
 
     def _build_ui(self) -> None:
+        self._themed_icons: list[tuple[QWidget, str, bool]] = []
         root = QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(16, 8, 16, 12)
+        outer.setContentsMargins(16, 6, 16, 12)
         outer.setSpacing(8)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
         title = QLabel("英语阅读标记器")
-        title.setStyleSheet("font-size: 16pt; font-weight: 700;")
+        title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch(1)
-        paste_button = QPushButton("＋  粘贴文章")
+
+        self.stats_button = QPushButton("学习统计")
+        self.stats_button.clicked.connect(self.open_stats)
+        self._themed_icons.append((self.stats_button, "stats", False))
+
+        self.sync_button = QPushButton("手机同步")
+        self.sync_button.clicked.connect(self.open_sync_dialog)
+        self._themed_icons.append((self.sync_button, "sync", False))
+
+        paste_button = QPushButton("粘贴文章")
         paste_button.clicked.connect(self.add_pasted_article)
-        import_button = QPushButton("导入 TXT")
+        self._themed_icons.append((paste_button, "plus", False))
+
+        import_button = QPushButton("导入文件")
+        import_button.setToolTip("支持 TXT / Markdown / EPUB / PDF，也可直接拖入窗口")
         import_button.clicked.connect(self.add_text_file)
+        self._themed_icons.append((import_button, "import", False))
+
         export_button = QPushButton("生词本")
         export_button.setObjectName("primaryButton")
         export_button.clicked.connect(self.open_vocabulary)
-        self.sync_button = QPushButton("手机同步")
-        self.sync_button.clicked.connect(self.open_sync_dialog)
+        self._themed_icons.append((export_button, "book", True))
+
+        header.addWidget(self.stats_button)
         header.addWidget(self.sync_button)
         header.addWidget(paste_button)
         header.addWidget(import_button)
@@ -455,13 +521,17 @@ class MainWindow(StudyUi, QMainWindow):
 
         left_panel = self._panel()
         left_panel.setMinimumWidth(180)
-        left_panel.setMaximumWidth(240)
+        left_panel.setMaximumWidth(270)
         self.library_panel = left_panel
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(15, 18, 15, 15)
+        left_layout.setContentsMargins(12, 14, 12, 12)
+        left_layout.setSpacing(8)
         left_layout.addWidget(self._section_label("我的文章"))
         self.add_library_controls(left_layout)
         self.article_list = QListWidget()
+        self.article_list.setMouseTracking(True)
+        self.article_delegate = ArticleCardDelegate(self.article_list)
+        self.article_list.setItemDelegate(self.article_delegate)
         self.article_list.currentItemChanged.connect(self._on_article_changed)
         self.article_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.article_list.customContextMenuRequested.connect(self.show_article_menu)
@@ -471,7 +541,7 @@ class MainWindow(StudyUi, QMainWindow):
         reader_panel = self._panel()
         reader_panel.setMinimumWidth(520)
         reader_layout = QVBoxLayout(reader_panel)
-        reader_layout.setContentsMargins(12, 10, 12, 10)
+        reader_layout.setContentsMargins(14, 10, 14, 10)
         reader_layout.setSpacing(6)
         reader_header = QHBoxLayout()
         reader_titles = QVBoxLayout()
@@ -484,65 +554,97 @@ class MainWindow(StudyUi, QMainWindow):
         reader_titles.addWidget(self.article_title_label)
         self.article_subtitle_label.hide()
         reader_header.addLayout(reader_titles, 1)
+        self.article_meta_label = QLabel("")
+        self.article_meta_label.setObjectName("muted")
+        reader_header.addWidget(self.article_meta_label)
         reader_layout.addLayout(reader_header)
 
         actions = QHBoxLayout()
+        actions.setSpacing(6)
         self.lookup_button = QToolButton()
         self.lookup_button.setText("翻译所选")
+        self.lookup_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.lookup_button.setMinimumHeight(36)
         self.lookup_button.clicked.connect(self.lookup_selection)
+        self._themed_icons.append((self.lookup_button, "translate", False))
+
         self.underline_button = QToolButton()
         self.underline_button.setText("划线")
         self.underline_button.setToolTip("划线 / 取消划线")
+        self.underline_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.underline_button.setMinimumHeight(36)
         self.underline_button.clicked.connect(self.toggle_underline)
+        self._themed_icons.append((self.underline_button, "underline", False))
+
         self.save_word_button = QToolButton()
         self.save_word_button.setText("＋ 生词")
+        self.save_word_button.setToolTip("一键加入生词本（未查词时自动查释义）")
+        self.save_word_button.setMinimumHeight(36)
         self.save_word_button.clicked.connect(self.save_vocabulary)
-        actions.addWidget(self.lookup_button)
-        actions.addWidget(self.underline_button)
-        actions.addWidget(self.save_word_button)
-        def action_menu(caption, entries):
+
+        actions.addWidget(self.lookup_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        actions.addWidget(self.underline_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        actions.addWidget(self.save_word_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        def action_menu(caption, entries, icon_name=""):
             button = QToolButton()
             button.setText(caption)
+            button.setMinimumHeight(36)
+            if icon_name:
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                self._themed_icons.append((button, icon_name, False))
             button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             menu = QMenu(button)
             for text, callback in entries:
                 menu.addAction(text, callback)
             button.setMenu(menu)
-            actions.addWidget(button)
+            actions.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
             return menu
 
-        speech_menu = action_menu("朗读", [
-            ("▶ 朗读所选", self.speak_selection),
-            ("▶ 朗读全文", self.speak_article),
-            ("暂停 / 继续", self.pause_speech),
-            ("停止朗读", self.stop_audio),
-        ])
-        action_menu("学习", [
-            ("收藏所选句段", self.save_selected_note),
-            ("句子收藏与笔记", self.open_notes),
-            ("生词复习", self.open_review),
-            ("听写练习（当前文章）", self.open_dictation),
-        ])
-        action_menu("设置", [("阅读显示与背景", self.open_display)])
-        # 发音按钮原来是独立入口，点一下就弹“发音与语速”窗口；实际只想快点调速，
-        # 现在改成：单击＝在 1 倍速与 0.75 倍速之间来回切（不弹任何窗口），
-        # 右键＝打开“发音与语速”改口音、发音来源、朗读声音。按钮上直接写着当前倍速。
+        speech_menu = action_menu(
+            "朗读",
+            [
+                ("▶ 朗读所选", self.speak_selection),
+                ("▶ 朗读全文", self.speak_article),
+                ("暂停 / 继续", self.pause_speech),
+                ("停止朗读", self.stop_audio),
+            ],
+            "play",
+        )
+        action_menu(
+            "学习",
+            [
+                ("收藏所选句段", self.save_selected_note),
+                ("句子收藏与笔记", self.open_notes),
+                ("生词复习", self.open_review),
+                ("听写练习（当前文章）", self.open_dictation),
+                ("学习统计", self.open_stats),
+            ],
+            "study",
+        )
+        action_menu("设置", [("阅读显示与背景", self.open_display), ("发音与语速设置", self.open_audio_settings)], "settings")
+
         self.audio_settings_button = QToolButton()
+        self.audio_settings_button.setObjectName("speedButton")
         self.audio_settings_button.setMinimumHeight(44)
         self.audio_settings_button.setMinimumWidth(104)
-        self.audio_settings_button.setStyleSheet("QToolButton { font-weight: 700; padding: 10px 16px; }")
         self.audio_settings_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.audio_settings_button.customContextMenuRequested.connect(lambda _point: self.open_audio_settings())
         self.audio_settings_button.clicked.connect(self.toggle_speech_speed)
         self._refresh_audio_button_text()
-        actions.addWidget(self.audio_settings_button)
+        actions.addWidget(self.audio_settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
         actions.addStretch(1)
+
         self.focus_button = QToolButton()
         self.focus_button.setText("专注阅读")
+        self.focus_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.focus_button.setMinimumHeight(36)
         self.focus_button.setCheckable(True)
         self.focus_button.toggled.connect(self.toggle_focus_reading)
-        actions.addWidget(self.focus_button)
+        self._themed_icons.append((self.focus_button, "focus", False))
+        actions.addWidget(self.focus_button, 0, Qt.AlignmentFlag.AlignVCenter)
         reader_layout.addLayout(actions)
+
         self.add_study_controls(reader_layout)
         sentence_action = speech_menu.addAction("显示逐句控制")
         sentence_action.setCheckable(True)
@@ -555,10 +657,8 @@ class MainWindow(StudyUi, QMainWindow):
         self.reader.sentence_repeat_requested.connect(self.keyboard_sentence_repeat)
         self.reader.speech_speed_requested.connect(self.set_speech_speed)
         self.reader.setReadOnly(True)
-        self.reader.setPlaceholderText("从左侧选择文章，或新建一篇文章。")
+        self.reader.setPlaceholderText("从左侧选择文章，或将 TXT / Markdown / EPUB / PDF 拖入窗口导入。")
         self.reader.setFont(QFont("Georgia", 14))
-        # A centered widget uses its sizeHint instead of filling the row. Give
-        # the editor the horizontal stretch; spacers center it only at its cap.
         self.reader.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         reading_row = QHBoxLayout()
         reading_row.setContentsMargins(0, 0, 0, 0)
@@ -567,7 +667,15 @@ class MainWindow(StudyUi, QMainWindow):
         reading_row.addWidget(self.reader, 1)
         reading_row.addStretch(0)
         reader_layout.addLayout(reading_row, 1)
-        self.status_label = QLabel("文章与标记仅保存在此电脑。")
+
+        self.reading_progress_bar = QProgressBar()
+        self.reading_progress_bar.setRange(0, 100)
+        self.reading_progress_bar.setValue(0)
+        self.reading_progress_bar.setTextVisible(False)
+        self.reading_progress_bar.setFixedHeight(5)
+        reader_layout.addWidget(self.reading_progress_bar)
+
+        self.status_label = QLabel("文章与标记仅保存在此电脑。支持拖入 TXT / MD / EPUB / PDF 导入。")
         self.status_label.setObjectName("muted")
         self.status_label.setWordWrap(True)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -576,10 +684,10 @@ class MainWindow(StudyUi, QMainWindow):
 
         right_panel = self._panel()
         right_panel.setMinimumWidth(220)
-        right_panel.setMaximumWidth(280)
+        right_panel.setMaximumWidth(300)
         self.translation_panel = right_panel
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(16, 18, 16, 15)
+        right_layout.setContentsMargins(16, 16, 16, 14)
         right_layout.addWidget(self._section_label("翻译助手"))
         self.selected_word_label = QLabel("尚未选择单词")
         self.selected_word_label.setObjectName("definition")
@@ -592,21 +700,69 @@ class MainWindow(StudyUi, QMainWindow):
         self.definition_label.setText("右键单词查看释义；先拖选内容再右键，可翻译整句或整段。")
         self.definition_label.setMinimumWidth(0)
         self.definition_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        self.definition_label.setStyleSheet('font-family: "Microsoft YaHei UI"; font-size: 11pt; padding: 8px; border: 0;')
-        self.definition_label.setObjectName("muted")
         right_layout.addWidget(self.selected_word_label)
         right_layout.addWidget(self.definition_label, 1)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([200, 1000, 240])
+        splitter.setSizes([215, 985, 250])
         self._build_vocabulary_window()
 
         add_action = QAction("添加文章", self)
         add_action.setShortcut("Ctrl+N")
         add_action.triggered.connect(self.add_pasted_article)
         self.addAction(add_action)
+
+    # ---- Drag & Drop multi-format import ------------------------------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in SUPPORTED_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            return
+        paths = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        if not paths:
+            return
+        event.acceptProposedAction()
+        self._import_article_from_path(paths[0])
+
+    def _import_article_from_path(self, path: Path) -> None:
+        try:
+            stem, text = import_article_file(path)
+        except Exception as error:
+            QMessageBox.warning(self, "导入失败", str(error))
+            return
+        dialog = ArticleEditorDialog(stem, text, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_article_from_dialog(dialog)
+
+    def _on_reader_scrolled(self):
+        bar = self.reader.verticalScrollBar()
+        pct = int(round(bar.value() * 100 / bar.maximum())) if bar.maximum() > 0 else (100 if self.reader.toPlainText().strip() else 0)
+        self.reading_progress_bar.setValue(max(0, min(100, pct)))
+        if not self._loading_article and hasattr(self, "progress_timer"):
+            self.progress_timer.start()
+
+    def _update_article_meta_strip(self, article_id: int | None) -> None:
+        if article_id is None:
+            self.article_meta_label.setText("")
+            return
+        text = self.reader.toPlainText()
+        words = len(re.findall(r"[A-Za-z0-9'-]+", text))
+        minutes = max(1, round(words / 180)) if words else 0
+        ann_count = len(self.repository.list_annotations(article_id))
+        vocab_count = sum(1 for v in self.repository.list_vocabulary() if v["article_id"] == article_id)
+        self.article_meta_label.setText(f"{words} 词 · 约 {minutes} 分钟 · 划线 {ann_count} · 生词 {vocab_count}")
 
     def toggle_focus_reading(self, enabled):
         self.library_panel.setVisible(not enabled)
@@ -617,36 +773,71 @@ class MainWindow(StudyUi, QMainWindow):
         if not hasattr(self, "sync_dialog"):
             self.sync_dialog = QDialog(self)
             self.sync_dialog.setWindowTitle("手机局域网同步")
-            self.sync_dialog.resize(600, 460)
+            self.sync_dialog.resize(680, 480)
             layout = QVBoxLayout(self.sync_dialog)
             note = QLabel("手机和电脑连接同一个 Wi-Fi 或路由器。电脑保持开机，阅读器保持运行。")
             note.setWordWrap(True)
             layout.addWidget(note)
+
+            body = QHBoxLayout()
             self.sync_info = QTextBrowser()
-            self.sync_info.setStyleSheet('font-family: "Microsoft YaHei UI"; font-size: 12pt;')
-            layout.addWidget(self.sync_info)
+            self.sync_info.setStyleSheet('font-family: "Microsoft YaHei UI"; font-size: 11pt;')
+            body.addWidget(self.sync_info, 1)
+
+            qr_box = QFrame()
+            qr_box.setObjectName("panel")
+            qr_box.setFixedWidth(210)
+            qr_layout = QVBoxLayout(qr_box)
+            qr_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.sync_qr_label = QLabel("开启同步后\n显示配对二维码")
+            self.sync_qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.sync_qr_label.setObjectName("muted")
+            self.sync_qr_label.setFixedSize(184, 184)
+            qr_layout.addWidget(self.sync_qr_label)
+            qr_caption = QLabel("扫码快速填入地址与配对码")
+            qr_caption.setObjectName("muted")
+            qr_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            qr_caption.setWordWrap(True)
+            qr_layout.addWidget(qr_caption)
+            body.addWidget(qr_box)
+            layout.addLayout(body, 1)
+
             self.auto_sync_checkbox = QCheckBox("下次启动软件时自动开启局域网同步")
             self.auto_sync_checkbox.setChecked(self.auto_start_sync)
             self.auto_sync_checkbox.toggled.connect(self._set_auto_start_sync)
             layout.addWidget(self.auto_sync_checkbox)
+            btn_row = QHBoxLayout()
             pair_button = QPushButton("开启同步 / 生成一次性配对码")
+            pair_button.setObjectName("primaryButton")
             pair_button.clicked.connect(self.enable_sync_pairing)
-            layout.addWidget(pair_button)
+            btn_row.addWidget(pair_button, 1)
             stop_button = QPushButton("停止局域网同步")
             stop_button.clicked.connect(self.stop_sync)
-            layout.addWidget(stop_button)
+            btn_row.addWidget(stop_button)
+            layout.addLayout(btn_row)
+
             if self.sync_service and self.sync_service.server:
                 addresses = self.sync_service.addresses()
                 self.sync_info.setPlainText(
-                    "同步服务已自动开启。\n\n电脑地址：\n" +
-                    "\n".join(addresses or ["未检测到局域网地址，请检查网络连接。"]) +
-                    "\n\n已配对手机会自动重连；如需配对新手机，请点击下方按钮生成一次性配对码。"
+                    "同步服务已自动开启。\n\n电脑地址：\n"
+                    + "\n".join(addresses or ["未检测到局域网地址，请检查网络连接。"])
+                    + "\n\n已配对手机会自动重连；如需配对新手机，请点击下方按钮生成一次性配对码。"
                 )
+                if addresses:
+                    self._update_sync_qr(addresses[0])
             else:
                 self.sync_info.setPlainText("点击下方按钮开启同步。在安卓 App 的“连接电脑”中填写这里显示的地址与配对码。")
         self.sync_dialog.show()
         self.sync_dialog.raise_()
         self.sync_dialog.activateWindow()
+
+    def _update_sync_qr(self, payload: str) -> None:
+        if not hasattr(self, "sync_qr_label"):
+            return
+        try:
+            self.sync_qr_label.setPixmap(render_qr_pixmap(payload, 180))
+        except Exception:
+            self.sync_qr_label.setText("二维码生成失败")
 
     def _set_auto_start_sync(self, enabled: bool) -> None:
         self.auto_start_sync = bool(enabled)
@@ -656,7 +847,10 @@ class MainWindow(StudyUi, QMainWindow):
     def _start_sync_service_silent(self) -> None:
         try:
             if self.sync_service is None:
-                self.sync_service = LanSyncService(self.repository.database_path, Path(sys.executable).parent / "EnglishReader_Android_v1.apk" if getattr(sys, "frozen", False) else None)
+                self.sync_service = LanSyncService(
+                    self.repository.database_path,
+                    Path(sys.executable).parent / "EnglishReader_Android_v1.apk" if getattr(sys, "frozen", False) else None,
+                )
             try:
                 self.sync_service.start()
             except OSError:
@@ -668,7 +862,10 @@ class MainWindow(StudyUi, QMainWindow):
     def enable_sync_pairing(self):
         try:
             if self.sync_service is None:
-                self.sync_service = LanSyncService(self.repository.database_path, Path(sys.executable).parent / "EnglishReader_Android_v1.apk" if getattr(sys, "frozen", False) else None)
+                self.sync_service = LanSyncService(
+                    self.repository.database_path,
+                    Path(sys.executable).parent / "EnglishReader_Android_v1.apk" if getattr(sys, "frozen", False) else None,
+                )
             try:
                 self.sync_service.start()
             except OSError:
@@ -676,10 +873,12 @@ class MainWindow(StudyUi, QMainWindow):
             code = self.sync_service.new_pairing_code()
             addresses = self.sync_service.addresses()
             self.sync_info.setPlainText(
-                "同步已开启\n先在手机浏览器打开以下地址，可下载安卓安装包。安装后进入 App 配对。\n\n电脑地址（选择与手机网络对应的一项）：\n" +
-                "\n".join(addresses or ["未检测到局域网地址，请检查网络连接。"] ) +
-                f"\n\n一次性配对码：{code}\n10 分钟内有效，成功配对一次后失效。\n\n已配对手机以后会自动重连。若 Windows 弹出网络访问提示，请由你允许家庭/专用网络访问。"
+                "同步已开启\n先在手机浏览器打开以下地址，可下载安卓安装包。安装后进入 App 配对。\n\n电脑地址（选择与手机网络对应的一项）：\n"
+                + "\n".join(addresses or ["未检测到局域网地址，请检查网络连接。"])
+                + f"\n\n一次性配对码：{code}\n10 分钟内有效，成功配对一次后失效。\n\n已配对手机以后会自动重连。若 Windows 弹出网络访问提示，请由你允许家庭/专用网络访问。"
             )
+            if addresses:
+                self._update_sync_qr(f"{addresses[0]}?code={code}")
             self.sync_button.setText("手机同步 · 已开启")
         except (OSError, RuntimeError) as error:
             self.sync_info.setPlainText("开启失败：" + str(error))
@@ -688,6 +887,10 @@ class MainWindow(StudyUi, QMainWindow):
         if self.sync_service:
             self.sync_service.stop()
         self.sync_info.setPlainText("局域网同步已停止。手机离线修改会留在手机上，重新开启服务后可补同步。")
+        if hasattr(self, "sync_qr_label"):
+            self.sync_qr_label.setPixmap(render_qr_pixmap("stopped", 1))
+            self.sync_qr_label.clear()
+            self.sync_qr_label.setText("同步已停止")
         self.sync_button.setText("手机同步")
 
     def save_reading_progress(self):
@@ -696,6 +899,28 @@ class MainWindow(StudyUi, QMainWindow):
             offset = qt_offset_to_python(self.reader.toPlainText(), position)
             self.repository.save_progress(self.current_article_id, offset)
 
+    def _populate_article_item(self, article: dict) -> QListWidgetItem:
+        item = QListWidgetItem(self.article_caption(article))
+        item.setToolTip(article["title"])
+        item.setData(Qt.ItemDataRole.UserRole, article["id"])
+        text = article.get("text", "")
+        word_count = len(re.findall(r"[A-Za-z0-9'-]+", text))
+        progress_offset = self.repository.get_progress(article["id"])
+        progress_pct = int(round(min(progress_offset, len(text)) * 100 / len(text))) if len(text) > 0 else 0
+        meta = article.get("meta", {})
+        item.setData(
+            ARTICLE_META_ROLE,
+            {
+                "title": article["title"],
+                "pinned": bool(meta.get("pinned")),
+                "read": bool(meta.get("read")),
+                "group_name": article.get("group_name", ""),
+                "word_count": word_count,
+                "progress": progress_pct,
+            },
+        )
+        return item
+
     def refresh_from_sync(self):
         revision = self.repository.sync_revision()
         if revision == self._sync_revision:
@@ -703,6 +928,8 @@ class MainWindow(StudyUi, QMainWindow):
         self._sync_revision = revision
         self._loading_article = True
         try:
+            if hasattr(self, "listening"):
+                self.listening.pull_from_study()
             self.refresh_group_filter()
             active_id = self.current_article_id
             cursor = self.reader.textCursor()
@@ -710,9 +937,7 @@ class MainWindow(StudyUi, QMainWindow):
             self.article_list.blockSignals(True)
             self.article_list.clear()
             for article in self.filtered_articles():
-                item = QListWidgetItem(self.article_caption(article))
-                item.setToolTip(article["title"])
-                item.setData(Qt.ItemDataRole.UserRole, article["id"])
+                item = self._populate_article_item(article)
                 self.article_list.addItem(item)
                 if article["id"] == active_id:
                     self.article_list.setCurrentItem(item)
@@ -723,10 +948,13 @@ class MainWindow(StudyUi, QMainWindow):
                 clear_cursor.select(QTextCursor.SelectionType.Document)
                 fmt = QTextCharFormat()
                 fmt.setFontUnderline(False)
+                fmt.clearBackground()
                 clear_cursor.mergeCharFormat(fmt)
                 self._apply_annotations(active_id)
+                self._refresh_reader_decorations()
                 self.reader.setTextCursor(cursor)
                 self.reader.verticalScrollBar().setValue(scroll)
+                self._update_article_meta_strip(active_id)
             elif self.article_list.count():
                 self.article_list.setCurrentRow(0)
             self.refresh_vocabulary()
@@ -736,12 +964,15 @@ class MainWindow(StudyUi, QMainWindow):
     def _build_vocabulary_window(self):
         self.vocabulary_dialog = QDialog(self)
         self.vocabulary_dialog.setWindowTitle("生词本 · 英语阅读标记器")
-        self.vocabulary_dialog.resize(880, 640)
+        self.vocabulary_dialog.resize(900, 660)
         self.vocabulary_dialog.setMinimumSize(560, 420)
         layout = QVBoxLayout(self.vocabulary_dialog)
         header = QHBoxLayout()
         header.addWidget(self._section_label("我的生词本"))
         header.addStretch(1)
+        review_btn = QPushButton("复习当前分类")
+        review_btn.clicked.connect(self.open_review)
+        header.addWidget(review_btn)
         export = QPushButton("导出 CSV")
         export.setObjectName("primaryButton")
         export.clicked.connect(self.export_vocabulary)
@@ -754,12 +985,14 @@ class MainWindow(StudyUi, QMainWindow):
         self.vocabulary_filter.setMinimumWidth(190)
         self.vocabulary_filter.currentIndexChanged.connect(self.refresh_vocabulary)
         tools.addWidget(self.vocabulary_filter, 1)
-        for title, callback in [("＋ 加入词组", self.add_vocabulary_entry),
-                                ("新建分类", self.create_vocabulary_category),
-                                ("重命名分类", self.rename_vocabulary_category),
-                                ("删除分类", self.delete_vocabulary_category),
-                                ("移到分类…", self.assign_vocabulary_category),
-                                ("删除生词", self.delete_selected_vocabulary)]:
+        for title, callback in [
+            ("＋ 加入词组", self.add_vocabulary_entry),
+            ("新建分类", self.create_vocabulary_category),
+            ("重命名分类", self.rename_vocabulary_category),
+            ("删除分类", self.delete_vocabulary_category),
+            ("移到分类…", self.assign_vocabulary_category),
+            ("删除生词", self.delete_selected_vocabulary),
+        ]:
             button = QPushButton(title)
             button.clicked.connect(callback)
             tools.addWidget(button)
@@ -771,8 +1004,12 @@ class MainWindow(StudyUi, QMainWindow):
         layout.addWidget(self.vocabulary_search)
 
         self.vocabulary_count = QLabel()
+        self.vocabulary_count.setObjectName("muted")
         layout.addWidget(self.vocabulary_count)
         self.vocabulary_list = VocabularyList()
+        self.vocabulary_list.setMouseTracking(True)
+        self.vocab_delegate = VocabularyCardDelegate(self.vocabulary_list)
+        self.vocabulary_list.setItemDelegate(self.vocab_delegate)
         self.vocabulary_list.setWordWrap(True)
         self.vocabulary_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.vocabulary_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -785,9 +1022,13 @@ class MainWindow(StudyUi, QMainWindow):
         self.vocabulary_context.setPlaceholderText("单击条目朗读单词，选中条目可查看释义、来源文章和原句。")
         self.vocabulary_context.setStyleSheet('font-family: "Microsoft YaHei UI"; font-size: 11pt; padding: 10px;')
         layout.addWidget(self.vocabulary_context, 1)
-        layout.addWidget(QLabel("单击即朗读；Ctrl/Shift 多选后可批量归类或删除（Delete 键同样删除）；右键可编辑词条。"
-                                "“＋ 加入词组”可自己录单词、词组、释义和例句（前面带 ✎）；"
-                                "标题以“听力:/阅读:”开头的文章里的生词自动进入“听力”“阅读”两类，手动归类优先。"))
+        tip = QLabel(
+            "单击即朗读；Ctrl/Shift 多选后可批量归类或删除（Delete 键同样删除）；右键可编辑词条或回到原文。"
+            "标题以“听力:/阅读:”开头的文章里的生词自动进入对应分类，手动归类优先。"
+        )
+        tip.setObjectName("muted")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
 
     def open_vocabulary(self):
         self.refresh_vocabulary()
@@ -834,7 +1075,8 @@ class MainWindow(StudyUi, QMainWindow):
         query = self.vocabulary_search.text().strip().casefold() if hasattr(self, "vocabulary_search") else ""
         if query:
             records = [
-                record for record in records
+                record
+                for record in records
                 if query in f"{record['word']}\n{record['definition']}\n{record['context']}\n{record['article_title']}".casefold()
             ]
         return records
@@ -883,10 +1125,10 @@ class MainWindow(StudyUi, QMainWindow):
         values = dialog.values()
         try:
             if record.get("manual"):
-                self.repository.update_vocabulary(record["id"], word=values["word"],
-                                                  definition=values["definition"], context=values["context"])
+                self.repository.update_vocabulary(
+                    record["id"], word=values["word"], definition=values["definition"], context=values["context"]
+                )
                 if values["word"].casefold() != str(record["word"]).casefold():
-                    # Category records are keyed by the wording, so move it along.
                     carried = values["category"] or categories.manual(record["word"])
                     categories.assign(record["word"], "")
                     if carried:
@@ -894,8 +1136,9 @@ class MainWindow(StudyUi, QMainWindow):
                 elif values["category"] != record.get("category"):
                     categories.assign(values["word"], values["category"])
             else:
-                self.repository.update_vocabulary(record["id"], definition=values["definition"],
-                                                  context=values["context"])
+                self.repository.update_vocabulary(
+                    record["id"], definition=values["definition"], context=values["context"]
+                )
                 if values["category"] != record.get("category"):
                     categories.assign(record["word"], values["category"])
         except ValueError as error:
@@ -932,9 +1175,9 @@ class MainWindow(StudyUi, QMainWindow):
         rename.triggered.connect(lambda: self.rename_article(item))
         article_id = int(item.data(Qt.ItemDataRole.UserRole))
         menu.addAction("编辑正文…", lambda: self.edit_article_text(article_id))
-        menu.addAction("移动到分组", lambda:self.assign_group(article_id))
-        menu.addAction("取消置顶" if self.study.metadata(article_id)['pinned'] else "置顶", lambda:self.toggle_article_flag(article_id,'pinned'))
-        menu.addAction("标为未读" if self.study.metadata(article_id)['read'] else "标为已读", lambda:self.toggle_article_flag(article_id,'read'))
+        menu.addAction("移动到分组", lambda: self.assign_group(article_id))
+        menu.addAction("取消置顶" if self.study.metadata(article_id)["pinned"] else "置顶", lambda: self.toggle_article_flag(article_id, "pinned"))
+        menu.addAction("标为未读" if self.study.metadata(article_id)["read"] else "标为已读", lambda: self.toggle_article_flag(article_id, "read"))
         menu.addSeparator()
         menu.addAction("删除文章", lambda: self.delete_article(article_id))
         menu.exec(self.article_list.viewport().mapToGlobal(position))
@@ -968,6 +1211,7 @@ class MainWindow(StudyUi, QMainWindow):
             self._sentence_index = 0
             self.apply_display()
             self._apply_annotations(article_id)
+            self._update_article_meta_strip(article_id)
             self._loading_article = False
         self.refresh_articles(self.current_article_id)
         self.refresh_vocabulary()
@@ -978,14 +1222,17 @@ class MainWindow(StudyUi, QMainWindow):
         article = self.repository.get_article(article_id)
         if article is None:
             return
-        if QMessageBox.question(
-            self,
-            "删除文章",
-            f"确定删除《{article['title']}》？\n\n"
-            "该文章的划线和源自本文的生词也会一并删除（自建词条不受影响），同步后手机上也会删掉。继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "删除文章",
+                f"确定删除《{article['title']}》？\n\n"
+                "该文章的划线和源自本文的生词也会一并删除（自建词条不受影响），同步后手机上也会删掉。继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
         self.stop_audio()
         try:
@@ -997,6 +1244,7 @@ class MainWindow(StudyUi, QMainWindow):
             self.current_article_id = None
             self.reader.clear()
             self.article_title_label.setText("选择一篇文章")
+            self._update_article_meta_strip(None)
         self.refresh_articles()
         self.refresh_vocabulary()
         self.status_label.setText(f"已删除文章《{article['title']}》。")
@@ -1023,23 +1271,25 @@ class MainWindow(StudyUi, QMainWindow):
         self.status_label.setText(f"文章已重命名为：{title}")
 
     def refresh_articles(self, select_id: int | None = None) -> None:
-        if not hasattr(self, 'article_list'): return
+        if not hasattr(self, "article_list"):
+            return
         active = self.current_article_id
         self.article_list.blockSignals(True)
         self.article_list.clear()
         selected_item = None
         for article in self.filtered_articles():
-            item = QListWidgetItem(self.article_caption(article))
-            item.setData(Qt.ItemDataRole.UserRole, article["id"])
-            item.setToolTip(article["title"])
+            item = self._populate_article_item(article)
             self.article_list.addItem(item)
-            if article["id"] == select_id: selected_item = item
+            if article["id"] == select_id:
+                selected_item = item
         if selected_item:
             self.article_list.setCurrentItem(selected_item)
         self.article_list.blockSignals(False)
         if selected_item:
-            if active != select_id or not self.reader.toPlainText(): self._on_article_changed(selected_item, None)
-            else: self.article_title_label.setText(self.repository.get_article(select_id)['title'])
+            if active != select_id or not self.reader.toPlainText():
+                self._on_article_changed(selected_item, None)
+            else:
+                self.article_title_label.setText(self.repository.get_article(select_id)["title"])
         elif active is None and self.article_list.count():
             self.article_list.setCurrentRow(0)
 
@@ -1065,7 +1315,8 @@ class MainWindow(StudyUi, QMainWindow):
         query = self.vocabulary_search.text().strip().casefold() if hasattr(self, "vocabulary_search") else ""
         if query:
             visible = [
-                record for record in visible
+                record
+                for record in visible
                 if query in f"{record['word']}\n{record['definition']}\n{record['context']}\n{record['article_title']}".casefold()
             ]
         self.vocabulary_list.clear()
@@ -1077,18 +1328,17 @@ class MainWindow(StudyUi, QMainWindow):
             item.setToolTip(f"{record['article_title'] or '自建词条'}\n{record['context']}\n\n单击朗读，右键归类、编辑或删除。")
             self.vocabulary_list.addItem(item)
         if self.vocabulary_list.count() and self.vocabulary_list.currentItem() is None:
-            # Fill the detail panel without speaking: only clicks read a word aloud.
             self.vocabulary_list.setCurrentRow(0)
         if not records:
             self.vocabulary_count.setText("生词本为空。可以在阅读时右键查词再“加入生词表”，也可以点“＋ 加入词组”自己写单词、词组和释义。")
         else:
             scope = "全部" if wanted in (None, "all") else (categories.name(wanted) or "未分类")
-            self.vocabulary_count.setText(
-                f"共 {len(records)} 条生词 · {scope} {len(visible)} 条 · 单击条目朗读，选中条目可查看原句。")
+            self.vocabulary_count.setText(f"共 {len(records)} 条生词 · {scope} {len(visible)} 条 · 单击条目朗读，选中条目可查看原句。")
 
     def create_vocabulary_category(self) -> str:
-        name, accepted = QInputDialog.getText(self.vocabulary_dialog, "新建生词分类",
-                                              "分类名称（如：必背、只识不拼、易混）：")
+        name, accepted = QInputDialog.getText(
+            self.vocabulary_dialog, "新建生词分类", "分类名称（如：必背、只识不拼、易混）："
+        )
         if not accepted or not name.strip():
             return ""
         try:
@@ -1106,8 +1356,9 @@ class MainWindow(StudyUi, QMainWindow):
         if not key or key == "all":
             self._show_hint("请先在“分类”下拉框里选中要改名的分类。")
             return
-        name, accepted = QInputDialog.getText(self.vocabulary_dialog, "重命名分类", "分类名称：",
-                                              QLineEdit.EchoMode.Normal, categories.name(key))
+        name, accepted = QInputDialog.getText(
+            self.vocabulary_dialog, "重命名分类", "分类名称：", QLineEdit.EchoMode.Normal, categories.name(key)
+        )
         if not accepted:
             return
         try:
@@ -1128,9 +1379,14 @@ class MainWindow(StudyUi, QMainWindow):
             name = categories.name(key)
         except Exception:
             name = ""
-        if QMessageBox.question(self.vocabulary_dialog, "删除分类",
-                                f"删除分类“{name}”？只删分类，生词本身保留（按文章标题重新自动归类）。继续？") \
-                != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.question(
+                self.vocabulary_dialog,
+                "删除分类",
+                f"删除分类“{name}”？只删分类，生词本身保留（按文章标题重新自动归类）。继续？",
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
         try:
             categories.delete(key)
@@ -1152,8 +1408,9 @@ class MainWindow(StudyUi, QMainWindow):
         names = [name for name, _ in options]
         current = items[0].data(Qt.ItemDataRole.UserRole).get("category", "")
         start = next((index for index, (_, key) in enumerate(options) if key == current), 0)
-        name, accepted = QInputDialog.getItem(self.vocabulary_dialog, "移到分类",
-                                              f"为所选 {len(items)} 个生词选择分类：", names, start, False)
+        name, accepted = QInputDialog.getItem(
+            self.vocabulary_dialog, "移到分类", f"为所选 {len(items)} 个生词选择分类：", names, start, False
+        )
         if not accepted:
             return
         key = options[names.index(name)][1]
@@ -1188,13 +1445,26 @@ class MainWindow(StudyUi, QMainWindow):
         words = "、".join(str(item.data(Qt.ItemDataRole.UserRole)["word"]) for item in items[:6])
         if len(items) > 6:
             words += "…"
-        if QMessageBox.question(self.vocabulary_dialog, "删除生词",
-                                f"从生词本删除 {len(items)} 条：{words}\n\n"
-                                "只删生词记录，文章里的划线保留；手机端同步后也会删掉这些生词。继续？") \
-                != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.question(
+                self.vocabulary_dialog,
+                "删除生词",
+                f"从生词本删除 {len(items)} 条：{words}\n\n"
+                "只删生词记录，文章里的划线保留；手机端同步后也会删掉这些生词。继续？",
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
         self.repository.delete_vocabulary([int(item.data(Qt.ItemDataRole.UserRole)["id"]) for item in items])
         self.refresh_vocabulary()
+        if self.current_article_id is not None:
+            clear_cursor = QTextCursor(self.reader.document())
+            clear_cursor.select(QTextCursor.SelectionType.Document)
+            fmt = QTextCharFormat()
+            fmt.clearBackground()
+            clear_cursor.mergeCharFormat(fmt)
+            self._apply_annotations(self.current_article_id)
+            self._update_article_meta_strip(self.current_article_id)
         self.status_label.setText(f"已删除 {len(items)} 条生词。")
 
     def show_vocabulary_menu(self, position) -> None:
@@ -1229,6 +1499,7 @@ class MainWindow(StudyUi, QMainWindow):
         if article is None:
             return
         self.lookup_request_id += 1
+        self._pending_auto_save_request_id = None
         self.stop_audio()
         if self.translation_popup:
             self.translation_popup.hide()
@@ -1249,11 +1520,14 @@ class MainWindow(StudyUi, QMainWindow):
         self.reader.setTextCursor(cursor)
         self.reader.ensureCursorVisible()
         self._loading_article = False
+        self._on_reader_scrolled()
+        self._update_article_meta_strip(article_id)
         self.selected_word_label.setText("尚未选择单词")
         self.definition_label.setText("右键单词查看释义；先拖选内容再右键，可翻译整句或整段。")
         self.status_label.setText("右键查词 / 翻译；工具栏支持所选内容与全文朗读。")
 
     def _apply_annotations(self, article_id: int) -> None:
+        t = get_theme(self._current_theme_name)
         original_cursor = self.reader.textCursor()
         article_text = self.reader.toPlainText()
         for annotation in self.repository.list_annotations(article_id):
@@ -1265,7 +1539,23 @@ class MainWindow(StudyUi, QMainWindow):
             )
             fmt = QTextCharFormat()
             fmt.setFontUnderline(True)
-            fmt.setUnderlineColor(QColor("#d06a35"))
+            fmt.setUnderlineColor(QColor(t["underline"]))
+            cursor.mergeCharFormat(fmt)
+        # Subtle warm tint for words already saved into the vocabulary book
+        vocab_color = QColor(t["vocab_tint"])
+        for entry in self.repository.list_vocabulary():
+            if entry.get("article_id") != article_id or entry.get("start") is None or entry.get("end") is None:
+                continue
+            if entry["end"] > len(article_text):
+                continue
+            cursor = QTextCursor(self.reader.document())
+            cursor.setPosition(python_offset_to_qt(article_text, entry["start"]))
+            cursor.setPosition(
+                python_offset_to_qt(article_text, entry["end"]),
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            fmt = QTextCharFormat()
+            fmt.setBackground(vocab_color)
             cursor.mergeCharFormat(fmt)
         self.reader.setTextCursor(original_cursor)
 
@@ -1301,7 +1591,6 @@ class MainWindow(StudyUi, QMainWindow):
         text = self.reader.toPlainText()
         start = qt_offset_to_python(text, cursor.selectionStart())
         end = qt_offset_to_python(text, cursor.selectionEnd())
-        # 拖选常常带上首尾空格；把范围收到文字本身，划线和生词记录的位置才与原文严格一致。
         start, end = trim_range(text, start, end)
         content = text[start:end]
         if not content:
@@ -1315,29 +1604,68 @@ class MainWindow(StudyUi, QMainWindow):
         if self.translation_popup:
             self.translation_popup.close()
         popup = QFrame(self, Qt.WindowType.Popup)
-        popup.setObjectName("panel")
+        popup.setObjectName("popupPanel")
+        shadow = QGraphicsDropShadowEffect(popup)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 60))
+        popup.setGraphicsEffect(shadow)
+
         layout = QVBoxLayout(popup)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        header_text = selected[2][:60] + ("…" if len(selected[2]) > 60 else "")
+        self.popup_title = QLabel(header_text)
+        self.popup_title.setObjectName("definition")
+        self.popup_title.setWordWrap(True)
+        layout.addWidget(self.popup_title)
+
         self.popup_definition = QTextBrowser()
-        self.popup_definition.setMinimumSize(390, 175)
+        self.popup_definition.setMinimumSize(400, 165)
+        self.popup_definition.setStyleSheet("border: 0; background: transparent; padding: 2px;")
         layout.addWidget(self.popup_definition)
+
         row = QHBoxLayout()
-        for caption, callback in [("▶ 发音 / 朗读", self.speak_selection), ("划线", self.toggle_underline), ("加入生词表", self.save_vocabulary), ("收藏句段", self.save_selected_note)]:
+        row.setSpacing(6)
+        for caption, callback in [
+            ("▶ 发音 / 朗读", self.speak_selection),
+            ("划线", self.toggle_underline),
+            ("加入生词表", self.save_vocabulary),
+            ("收藏句段", self.save_selected_note),
+        ]:
             button = QPushButton(caption)
+            if caption == "加入生词表":
+                button.setObjectName("primaryButton")
             button.clicked.connect(callback)
             row.addWidget(button)
         layout.addLayout(row)
         popup.adjustSize()
         screen = QApplication.screenAt(position) or QApplication.primaryScreen()
         bounds = screen.availableGeometry()
-        popup.move(max(bounds.left(), min(position.x(), bounds.right() - popup.width())), max(bounds.top(), min(position.y(), bounds.bottom() - popup.height())))
+        popup.move(
+            max(bounds.left(), min(position.x(), bounds.right() - popup.width())),
+            max(bounds.top(), min(position.y(), bounds.bottom() - popup.height())),
+        )
         self.translation_popup = popup
         popup.show()
         self.lookup_selection()
 
-    def _display_translation(self, text):
-        self.definition_label.setText(text)
-        if self.translation_popup and self.translation_popup.isVisible():
-            self.popup_definition.setPlainText(text)
+    def _display_translation(self, text: str, *, word: str = "", rich: bool = False):
+        dark = is_dark_theme(self._current_theme_name)
+        entry = lookup_local_entry(word) if (rich and word) else None
+        if rich and ("\n" in text or entry):
+            html_body = format_translation_html(word, text, entry=entry, dark=dark)
+            self.definition_label.set_rich(text, html_body)
+            if self.translation_popup and self.translation_popup.isVisible():
+                # Keep popup plain text exact when there's no local entry metadata
+                if entry:
+                    self.popup_definition.setHtml(html_body)
+                else:
+                    self.popup_definition.setPlainText(text)
+        else:
+            self.definition_label.setText(text)
+            if self.translation_popup and self.translation_popup.isVisible():
+                self.popup_definition.setPlainText(text)
 
     def lookup_selection(self) -> None:
         selected = self._get_translation_selection()
@@ -1394,22 +1722,30 @@ class MainWindow(StudyUi, QMainWindow):
         engine.addItem("系统英文语音（离线，机器合成音）", "system")
         engine.setCurrentIndex(max(0, engine.findData(self.audio_engine)))
         layout.addWidget(engine)
-        layout.addWidget(QLabel("单词优先使用词典真人的发音；句子和全文默认用微软神经网络语音（和美音 Aria / 英音 Sonia），断网时自动改用系统语音。"))
+        note = QLabel("单词优先使用词典真人的发音；句子和全文默认用微软神经网络语音（和美音 Aria / 英音 Sonia），断网时自动改用系统语音。")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         save = QPushButton("保存")
+        save.setObjectName("primaryButton")
         save.clicked.connect(dialog.accept)
         layout.addWidget(save)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.stop_audio()
             self.audio_source, self.audio_accent, self.audio_speed = source.currentData(), accent.currentData(), speed.currentData()
             self.audio_engine = engine.currentData()
-            for key, value in (("source", self.audio_source), ("accent", self.audio_accent), ("speed", self.audio_speed), ("engine", self.audio_engine)):
+            for key, value in (
+                ("source", self.audio_source),
+                ("accent", self.audio_accent),
+                ("speed", self.audio_speed),
+                ("engine", self.audio_engine),
+            ):
                 self.audio_settings.setValue(key, value)
             self.audio_settings.sync()
             self.status_label.setText("发音设置已保存。")
             self._refresh_audio_button_text()
 
     def _refresh_audio_button_text(self) -> None:
-        """按钮上直接写着当前倍速：单击只在 1 倍速与 0.75 倍速之间切，右键才开设置窗口。"""
         self.audio_settings_button.setText(f"🔊 {float(self.audio_speed):g} 倍速")
         self.audio_settings_button.setToolTip(
             "单击：在 1 倍速与 0.75 倍速之间切换（不弹窗）\n"
@@ -1417,7 +1753,6 @@ class MainWindow(StudyUi, QMainWindow):
         )
 
     def toggle_speech_speed(self) -> None:
-        """点一下按钮：1 倍速 ↔ 0.75 倍速，别的倍速（含 0.6/0.9/1.25）先回到 0.75。"""
         target = 1.0 if abs(float(self.audio_speed) - 0.75) < 1e-6 else 0.75
         self.set_speech_speed(
             target,
@@ -1425,11 +1760,6 @@ class MainWindow(StudyUi, QMainWindow):
         )
 
     def set_speech_speed(self, speed: float, hint: str = "快捷键 1＝1 倍速，2＝0.75 倍速") -> None:
-        """Number-key shortcut in the reader: 1 = 1 倍速, 2 = 0.75 倍速.
-
-        The setting is the same one the 发音 button writes, so words, sentences and
-        full-text reading all follow it and it survives a restart.
-        """
         speed = float(speed)
         if abs(speed - float(self.audio_speed)) < 1e-6:
             self.status_label.setText(f"当前已是 {speed:g} 倍速（{hint}）。")
@@ -1437,7 +1767,6 @@ class MainWindow(StudyUi, QMainWindow):
         self.audio_speed = speed
         self.audio_settings.setValue("speed", speed)
         self.audio_settings.sync()
-        # 正在播的词典音频可以立刻变速；句子语音从下一句起按新语速读。
         try:
             self.word_player.setPlaybackRate(speed)
         except Exception:
@@ -1520,10 +1849,15 @@ class MainWindow(StudyUi, QMainWindow):
         self.status_label.setText(f"正在以 {self.audio_speed:g} 倍速朗读英文，可暂停或停止。")
 
     def pause_speech(self):
-        if hasattr(self,'sentence_timer') and self.sentence_timer.isActive():
-            self.sentence_timer.stop(); self._gap_paused = True; self._show_hint('已暂停句间等待'); return
-        if getattr(self,'_gap_paused',False):
-            self._gap_paused = False; self.sentence_timer.start(0); return
+        if hasattr(self, "sentence_timer") and self.sentence_timer.isActive():
+            self.sentence_timer.stop()
+            self._gap_paused = True
+            self._show_hint("已暂停句间等待")
+            return
+        if getattr(self, "_gap_paused", False):
+            self._gap_paused = False
+            self.sentence_timer.start(0)
+            return
         if self.word_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.word_player.pause()
         elif self.word_player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
@@ -1552,6 +1886,8 @@ class MainWindow(StudyUi, QMainWindow):
     def _on_lookup_finished(self, request_id: int, selection: tuple[int, int, str], result: object) -> None:
         if request_id != self.lookup_request_id:
             return
+        auto_save = self._pending_auto_save_request_id == request_id
+        self._pending_auto_save_request_id = None
         if isinstance(result, Exception):
             self.current_definition = ""
             self._display_translation(str(result))
@@ -1560,7 +1896,9 @@ class MainWindow(StudyUi, QMainWindow):
         self.current_definition = str(result)
         self.definition_selection = selection
         self.selected_word_label.setText(selection[2][:80] + ("…" if len(selection[2]) > 80 else ""))
-        self._display_translation(self.current_definition)
+        self._display_translation(self.current_definition, word=selection[2], rich=True)
+        if auto_save and self.current_article_id is not None:
+            self._commit_vocabulary(selection, self.current_definition)
 
     def toggle_underline(self) -> None:
         selected = self._get_selection()
@@ -1569,6 +1907,7 @@ class MainWindow(StudyUi, QMainWindow):
         start, end, word = selected
         annotations = self.repository.list_annotations(self.current_article_id)
         existing = next((item for item in annotations if item["start"] == start and item["end"] == end), None)
+        t = get_theme(self._current_theme_name)
         if existing:
             self.repository.remove_annotation(self.current_article_id, start, end)
             fmt = QTextCharFormat()
@@ -1580,26 +1919,46 @@ class MainWindow(StudyUi, QMainWindow):
             self.repository.add_annotation(self.current_article_id, start, end, word)
             fmt = QTextCharFormat()
             fmt.setFontUnderline(True)
-            fmt.setUnderlineColor(QColor("#d06a35"))
+            fmt.setUnderlineColor(QColor(t["underline"]))
             self.reader.textCursor().mergeCharFormat(fmt)
             self.status_label.setText(f"已标记本文中的这处 {word}。")
+        self._update_article_meta_strip(self.current_article_id)
+
+    def _commit_vocabulary(self, selected: tuple[int, int, str], definition: str) -> None:
+        if self.current_article_id is None:
+            return
+        self.repository.add_vocabulary(
+            self.current_article_id, selected[0], selected[1], selected[2], definition
+        )
+        self._apply_annotations(self.current_article_id)
+        self._update_article_meta_strip(self.current_article_id)
+        self.refresh_vocabulary()
+        self.status_label.setText(f"已将 {selected[2]} 加入生词表。")
 
     def save_vocabulary(self) -> None:
         selected = self._get_selection()
         if selected is None or self.current_article_id is None:
             return
-        # 释义是按“选中的文字”配对的，不是按位置元组：右键查词、拖选“翻译所选”
-        # 两条路径的范围可能差一个空格，只要文字一致就用这条释义。
         matched = self.definition_selection is not None and self.definition_selection[2] == selected[2]
         definition = self.current_definition if matched else ""
         if not definition:
-            self._show_hint(f"先给“{selected[2]}”查中文释义（翻译所选 / 右键查词），再加入生词表。")
+            # One-click vocabulary saving: look up locally first, or async online then auto-save
+            cached = cached_translation(selected[2])
+            if cached:
+                self.current_definition = cached
+                self.definition_selection = selected
+                self._display_translation(cached, word=selected[2], rich=True)
+                self._commit_vocabulary(selected, cached)
+                return
+            self.lookup_request_id += 1
+            request_id = self.lookup_request_id
+            self._pending_auto_save_request_id = request_id
+            self._display_translation("正在查询释义并自动加入生词表……")
+            worker = LookupWorker(selected[2], selected, request_id)
+            worker.signals.finished.connect(self._on_lookup_finished)
+            self.thread_pool.start(worker)
             return
-        self.repository.add_vocabulary(
-            self.current_article_id, selected[0], selected[1], selected[2], definition
-        )
-        self.refresh_vocabulary()
-        self.status_label.setText(f"已将 {selected[2]} 加入生词表。")
+        self._commit_vocabulary(selected, definition)
 
     def add_pasted_article(self) -> None:
         dialog = ArticleEditorDialog(parent=self)
@@ -1608,19 +1967,14 @@ class MainWindow(StudyUi, QMainWindow):
 
     def add_text_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "导入文本文章", str(Path.home()), "文本文件 (*.txt);;所有文件 (*)"
+            self,
+            "导入文章",
+            str(Path.home()),
+            "支持的文件 (*.txt *.md *.markdown *.epub *.pdf);;文本文件 (*.txt);;所有文件 (*)",
         )
         if not file_path:
             return
-        path = Path(file_path)
-        raw = path.read_bytes()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
-        dialog = ArticleEditorDialog(path.stem, text, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._save_article_from_dialog(dialog)
+        self._import_article_from_path(Path(file_path))
 
     def _save_article_from_dialog(self, dialog: ArticleEditorDialog) -> None:
         title, text = dialog.article()
@@ -1650,8 +2004,11 @@ class MainWindow(StudyUi, QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("数据与备份")
         layout = QVBoxLayout(dialog)
-        label = QLabel("文章、划线和生词保存在：\n" + str(self.repository.database_path.parent)
-                       + "\n\n每天首次打开自动备份；旧资料库迁移前也会保留副本。")
+        label = QLabel(
+            "文章、划线和生词保存在：\n"
+            + str(self.repository.database_path.parent)
+            + "\n\n每天首次打开自动备份；旧资料库迁移前也会保留副本。"
+        )
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(label)
@@ -1659,12 +2016,14 @@ class MainWindow(StudyUi, QMainWindow):
         open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.repository.database_path.parent))))
         layout.addWidget(open_button)
         backup_button = QPushButton("立即备份")
+
         def save_backup():
             try:
                 path = backup_database(self.repository.database_path)
                 QMessageBox.information(dialog, "备份完成", "已保存到：\n" + str(path))
             except Exception as error:
                 QMessageBox.warning(dialog, "备份失败", str(error))
+
         backup_button.clicked.connect(save_backup)
         layout.addWidget(backup_button)
         dialog.resize(580, 230)
@@ -1685,7 +2044,10 @@ def main() -> int:
     app.setApplicationName("EnglishReadingMarker")
     app.setOrganizationName("CodexProjects")
     data_directory().mkdir(parents=True, exist_ok=True)
-    app_lock = QLockFile(str(data_directory() / 'application.lock'))
+    icon_path = data_directory() / "kurisu.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+    app_lock = QLockFile(str(data_directory() / "application.lock"))
     app_lock.setStaleLockTime(0)
     if not app_lock.tryLock(0):
         QMessageBox.information(None, "程序已打开", "阅读器已经在运行，请使用已打开的窗口。")
