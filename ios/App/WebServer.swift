@@ -90,10 +90,9 @@ final class WebServer {
             var accumulated = buffer
             if let data { accumulated.append(data) }
             // 请求头以空行结束；GET 无 body，收到空行即可处理。
+            // 注意：绝不能在这里同步调用 connection.cancel()，否则异步 send() 还没发完就会掐断连接导致 WKWebView 白屏。
             if let range = accumulated.range(of: Data("\r\n\r\n".utf8)) {
                 self.handle(connection, request: Data(accumulated[..<range.lowerBound]))
-                connection.cancel()
-                self.queue.async { self.connections.removeAll { $0 === connection } }
             } else if isComplete {
                 connection.cancel()
             } else {
@@ -173,7 +172,10 @@ final class WebServer {
         response += "Connection: close\r\n\r\n"
         var payload = Data(response.utf8)
         payload.append(body)
-        connection.send(content: payload, completion: .contentProcessed { _ in })
+        connection.send(content: payload, isComplete: true, completion: .contentProcessed { [weak self] _ in
+            connection.cancel()
+            self?.queue.async { self?.connections.removeAll { $0 === connection } }
+        })
     }
 
     private func mime(_ ext: String) -> String {

@@ -51,6 +51,24 @@
 		<string>audio</string>
 	</array>
 
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+
 	<!--
 	  对应安卓 AndroidManifest 里的 android:usesCleartextTraffic="true"。
 	  iOS 的等价物是 ATS：桌面同步服务是 http://192.168.x.x:18765 明文，
